@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""lector - paste a markdown document, get a narrated MP3.
+
+Boundaries (see /about): the OpenAI key lives only in this process's environment
+(never the client, never the repo); accounts are password-gated with hashed
+credentials and signed sessions; every job and account action is logged; the app
+produces audio and nothing else - it never sends, publishes, or posts.
+"""
+import os, re, io, json, time, uuid, shutil, secrets, smtplib, threading, datetime
+import urllib.request, urllib.error
+from email.message import EmailMessage
+from flask import (Flask, request, redirect, url_for, send_file, abort, Response,
+                   render_template_string, session)
+from werkzeug.security import generate_password_hash, check_password_hash
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+JOBS_DIR = os.path.join(APP_DIR, "jobs")
+SAMPLES_DIR = os.path.join(APP_DIR, "samples")
+LIBRARY_DIR = os.path.join(APP_DIR, "library")
+STATE_DIR = os.path.join(APP_DIR, "state")
+USERS_PATH = os.path.join(STATE_DIR, "users.json")
+SECRET_PATH = os.path.join(STATE_DIR, "secret.key")
+LOG_PATH = os.path.join(APP_DIR, "lector.log")
+for d in (JOBS_DIR, LIBRARY_DIR, STATE_DIR):
+    os.makedirs(d, exist_ok=True)
+
+MODEL = "gpt-4o-mini-tts"
+CHUNK_LIMIT = 3600
+MAX_INPUT = 400 * 1024
+VOICES = ["onyx", "alloy", "nova", "shimmer", "sage", "fable", "echo"]
+INSTRUCTIONS = ("Read as a calm, measured, articulate audiobook narrator. "
+                "Natural pacing, clear diction, a short pause at each section heading.")
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+TOKENS_PATH = os.path.join(STATE_DIR, "tokens.json")
+BASE_URL = os.environ.get("LECTOR_BASE_URL", "https://lector.stephens.page")
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "resend")
+SMTP_PASS = os.environ.get("SMTP_PASS")
+SMTP_FROM = os.environ.get("SMTP_FROM", "you@example.com")
+
+app = Flask(__name__)
+app.config.update(MAX_CONTENT_LENGTH=MAX_INPUT + 64 * 1024,
+                  SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=True,
+                  SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=30),
+                  USE_X_SENDFILE=(os.environ.get("LECTOR_XSENDFILE") == "1"))
+
+if not os.path.exists(SECRET_PATH):
+    with open(os.open(SECRET_PATH, os.O_CREAT | os.O_WRONLY, 0o600), "w") as f:
+        f.write(secrets.token_hex(32))
+app.secret_key = open(SECRET_PATH).read().strip()
+
+JOBS = {}
+LOG_LOCK = threading.Lock()
+USER_LOCK = threading.Lock()
+
+
+# ----------------------------------------------------------------------- accounts
+def load_users():
+    try:
+        return json.load(open(USERS_PATH))
+    except Exception:
+        return {}
+
+
+def save_users(users):
+    tmp = USERS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(users, f, indent=2)
+    os.replace(tmp, USERS_PATH)
+
+
+def user_lib(name):
+    d = os.path.join(LIBRARY_DIR, name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def send_email(to, subject, html):
+    """Send a transactional email via Resend SMTP. Returns True on success."""
+    if not (SMTP_HOST and SMTP_PASS):
+        log("-", to, "email-unconfigured", subject)
+        return False
+    msg = EmailMessage()
+    msg["From"] = SMTP_FROM
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(re.sub(r"<[^>]+>", "", html))
+    msg.add_alternative(html, subtype="html")
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        log("-", to, "email-sent", subject)
+        return True
+    except Exception as e:
+        log("-", to, "email-error", str(e)[:160])
+        return False
+
+
+def _load_tokens():
+    try:
+        return json.load(open(TOKENS_PATH))
+    except Exception:
+        return {}
+
+
+def new_token(email, kind, ttl):
+    tok = secrets.token_urlsafe(32)
+    now = time.time()
+    with USER_LOCK:
+        toks = {k: v for k, v in _load_tokens().items() if v.get("exp", 0) > now}
+        toks[tok] = {"email": email, "kind": kind, "exp": now + ttl}
+        with open(TOKENS_PATH + ".tmp", "w") as f:
+            json.dump(toks, f)
+        os.replace(TOKENS_PATH + ".tmp", TOKENS_PATH)
+    return tok
+
+
+def peek_token(tok):
+    e = _load_tokens().get(tok)
+    return e if e and e.get("exp", 0) > time.time() else None
+
+
+def pop_token(tok):
+    with USER_LOCK:
+        toks = _load_tokens()
+        e = toks.pop(tok, None)
+        with open(TOKENS_PATH + ".tmp", "w") as f:
+            json.dump(toks, f)
+        os.replace(TOKENS_PATH + ".tmp", TOKENS_PATH)
+    return e if e and e.get("exp", 0) > time.time() else None
+
+
+def current_user():
+    return session.get("user")
+
+
+def is_admin():
+    return bool(load_users().get(current_user(), {}).get("admin"))
+
+
+# ---------------------------------------------------------------- narration engine
+def clean_markdown(md):
+    out = []
+    for raw in md.split("\n"):
+        line = raw.rstrip()
+        if re.match(r"^\s*(---+|```)\s*$", line):
+            out.append("")
+            continue
+        if line.lstrip().startswith("|"):
+            if re.match(r"^\s*\|[\s\|:\-]+\|?\s*$", line):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|") if c.strip()]
+            line = ". ".join(cells)
+        for _ in range(3):
+            line = re.sub(r"\[([^\]]*)\]\((?:[^)]*)\)", r"\1", line)
+        line = re.sub(r"https?://\S+", "", line)
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = re.sub(r"^\s*>\s?", "", line)
+        line = re.sub(r"^\s*[-*]\s+", "", line)
+        line = line.replace("`", "").replace("**", "").replace("__", "")
+        line = re.sub(r"(?<!\w)[*_](?=\w)", "", line)
+        line = re.sub(r"(?<=\w)[*_](?!\w)", "", line)
+        line = line.replace("*", "")
+        out.append(line)
+    text = "\n".join(out)
+    text = re.sub(r"[①-⑨]", lambda m: " item " + str(ord(m.group()) - 0x245F), text)
+    text = re.sub(r"\b([\w-]+)\.md\b", r"\1", text)
+    text = text.replace("§", "section ").replace("→", " to ").replace("↔", " and ")
+    text = text.replace("≤", "at most ").replace("≥", "at least ")
+    text = text.replace("×", " times ").replace("%", " percent")
+    text = text.replace("·", ". ").replace("&middot;", ". ").replace("&nbsp;", " ")
+    text = text.replace("&amp;", "and").replace("&emsp;", " ")
+    text = re.sub(r"(\d)\s*[–—\-]\s*(\d)", r"\1 to \2", text)
+    text = text.replace("—", ", ").replace("–", ", ")
+    text = re.sub(r"(\d)K\b", r"\1 thousand", text)
+    text = re.sub(r"\$\s?(\d[\d,\.]*)", r"\1 dollars", text)
+    text = re.sub(r"(\d)\+", r"\1 plus", text)
+    for pat, val in {r"\bADRs\b": "architecture decision records",
+                     r"\bADR\b": "architecture decision record",
+                     r"\bhr/wk\b": "hours per week", r"\bK8s\b": "Kubernetes",
+                     r"\bIaC\b": "infrastructure as code", r"\bJDs\b": "job descriptions",
+                     r"\bJD\b": "job description", r"\bPR #148\b": "pull request 148"}.items():
+        text = re.sub(pat, val, text)
+    fixed = []
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if s and not re.search(r"[.!?:;,]$", s) and len(s) < 120:
+            s += "."
+        fixed.append(s)
+    text = re.sub(r"[ \t]+", " ", "\n".join(fixed))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def chunk(text, limit=CHUNK_LIMIT):
+    chunks, buf = [], ""
+    for p in [p.strip() for p in text.split("\n\n") if p.strip()]:
+        parts = re.split(r"(?<=[.!?])\s+", p) if len(p) > limit else [p]
+        for part in parts:
+            add = ("\n\n" if buf else "") + part
+            if len(buf) + len(add) > limit and buf:
+                chunks.append(buf)
+                buf = part
+            else:
+                buf += add
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def tts(text, voice):
+    body = json.dumps({"model": MODEL, "voice": voice, "input": text,
+                       "instructions": INSTRUCTIONS}).encode()
+    req = urllib.request.Request("https://api.openai.com/v1/audio/speech", data=body,
+                                 headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+                                          "Content-Type": "application/json"})
+    last = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"TTS failed: {last}")
+
+
+def run_job(job_id, md, voice, title, owner):
+    job = JOBS[job_id]
+    started = time.time()
+    try:
+        text = clean_markdown(md)
+        chunks = chunk(text)
+        job.update(status="running", total=len(chunks), done=0, words=len(text.split()))
+        out_path = os.path.join(JOBS_DIR, job_id + ".mp3")
+        with open(out_path, "wb") as f:
+            for i, c in enumerate(chunks, 1):
+                f.write(tts(c, voice))
+                job["done"] = i
+        job.update(status="done", file=out_path, secs=round(time.time() - started))
+        log(owner, title, "done", f"{job['words']}w/{len(chunks)}ch/{job['secs']}s")
+    except Exception as e:
+        job.update(status="error", error=str(e))
+        log(owner, title, "error", str(e)[:200])
+
+
+def log(who, title, status, detail):
+    line = json.dumps({"t": datetime.datetime.now().isoformat(timespec="seconds"),
+                       "user": who, "title": str(title)[:80], "status": status, "detail": detail})
+    with LOG_LOCK:
+        with open(LOG_PATH, "a") as f:
+            f.write(line + "\n")
+
+
+# ------------------------------------------------------------------------ templates
+PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>{{title}}</title>
+<style>
+:root{color-scheme:light dark}
+body{font:17px/1.6 -apple-system,Segoe UI,Roboto,sans-serif;max-width:46rem;margin:1.2rem auto;padding:0 1.1rem;color:#1a1a1a;background:#fafafa}
+nav{display:flex;gap:.9rem;align-items:center;font-size:.9rem;border-bottom:1px solid #e3e3e3;padding-bottom:.6rem;margin-bottom:1.2rem}
+nav .brand{font-weight:700}nav .sp{flex:1}nav .who{color:#777}
+h1{font-size:1.7rem;margin:0 0 .2rem}h1 a{color:inherit;text-decoration:none}
+.sub{color:#666;margin:.1rem 0 1.4rem}
+textarea{width:100%;min-height:13rem;font:14px/1.5 ui-monospace,Menlo,monospace;padding:.7rem;border:1px solid #ccc;border-radius:8px;box-sizing:border-box}
+label{display:block;font-weight:600;margin:1rem 0 .3rem}
+select,input{font:inherit;padding:.45rem;border:1px solid #ccc;border-radius:6px}
+input[type=file]{border:0;padding:.4rem 0}
+button{font:inherit;font-weight:600;background:#002A4F;color:#fff;border:0;border-radius:8px;padding:.6rem 1.3rem;margin-top:1rem;cursor:pointer}
+.row{display:flex;gap:1.5rem;flex-wrap:wrap;align-items:end}
+.muted{color:#777;font-size:.92rem}a{color:#064b87}
+footer{margin-top:2.5rem;border-top:1px solid #e3e3e3;padding-top:1rem;color:#777;font-size:.86rem}
+.bar{height:.5rem;background:#e6e6e6;border-radius:4px;overflow:hidden;margin:.6rem 0}.bar>i{display:block;height:100%;background:#064b87}
+audio{width:100%;margin:.6rem 0 .2rem}
+.skiprow{display:flex;gap:.5rem;margin:0 0 .4rem}
+.skiprow button{margin:0;padding:.3rem .8rem;font-size:.85rem;background:#eef1f4;color:#13314d;border:1px solid #cdd6df}
+.voicegrid{display:flex;flex-wrap:wrap;gap:.7rem;margin:.3rem 0}
+.vc{display:flex;flex-direction:column;gap:.2rem;font-size:.8rem;color:#555}.vc audio{width:12.5rem;height:2.2rem;margin:0}
+table.u{border-collapse:collapse;width:100%}table.u td,table.u th{border-bottom:1px solid #e3e3e3;text-align:left;padding:.4rem .3rem;font-size:.95rem}
+</style></head><body>
+<nav>{% if user %}<a class=brand href="/">lector</a><span class=sp></span>
+<span class=who>{{user}}</span><a href="/account">account</a>{% if admin %}<a href="/admin">admin</a>{% endif %}<a href="/logout">log out</a>
+{% else %}<span class=brand>lector</span>{% endif %}</nav>
+{{body|safe}}
+<footer>lector reads documents aloud and nothing else - it never sends, publishes, or
+posts anything. Audio is synthesized by OpenAI ({{model}}); the voices are synthetic and
+the model's training provenance is not disclosed by the vendor. The API key lives only in
+this server's environment. <a href="/about">How it works &amp; boundaries</a>.</footer>
+<script>function lskip(id,n){var a=document.getElementById(id);if(a){a.currentTime=Math.max(0,(a.currentTime||0)+n);}}</script>
+</body></html>"""
+
+HOME = """<h1><a href="/">lector</a></h1>
+<p class=sub>Paste a markdown document. Get an MP3 you can listen to. &middot; <a href="/library">Library</a></p>
+<form method=post action="/convert" enctype=multipart/form-data>
+<input type=hidden name=_csrf value="{{csrf}}">
+<label for=md>Markdown</label>
+<textarea id=md name=md placeholder="# Paste markdown here, or choose a .md file below"></textarea>
+<div class=row>
+<div><label for=file>...or upload a file</label><input id=file type=file name=file accept=".md,.markdown,.txt"></div>
+<div><label for=voice>Voice</label><select id=voice name=voice>{% for v in voices %}<option{% if v=='onyx' %} selected{% endif %}>{{v}}</option>{% endfor %}</select></div>
+</div>
+<label>Hear the voices</label>
+<div class=voicegrid>{% for v in voices %}<div class=vc><span>{{v}}</span><audio controls preload=none src="/sample/{{v}}"></audio></div>{% endfor %}</div>
+<button type=submit>Convert to audio</button>
+</form>
+<p class=muted style=margin-top:1.4rem>Citations like <code>&sect;102</code> are read as "section 102"; tables are read as plain sentences; links and raw URLs are dropped.</p>"""
+
+JOB = """<h1><a href="/">lector</a></h1>
+<p class=sub>{{job.title}}</p>
+{% if job.status in ['queued','running'] %}
+<p><b>Synthesizing...</b> {{job.get('done',0)}} / {{job.get('total','?')}} chunks
+{% if job.get('words') %}({{job.words}} words){% endif %}</p>
+<div class=bar><i style="width:{{pct}}%"></i></div>
+<p class=muted>This page refreshes every few seconds. A long document (10k+ words) takes a few minutes.</p>
+{% elif job.status=='done' %}
+<p><b>Ready.</b> {{job.words}} words, {{job.total}} chunks, synthesized in {{job.secs}}s.</p>
+<audio id=pj controls preload=metadata src="/job/{{id}}/audio"></audio>
+<div class=skiprow><button type=button onclick="lskip('pj',-15)">&laquo; 15s</button><button type=button onclick="lskip('pj',15)">15s &raquo;</button></div>
+<p><a href="/job/{{id}}/audio" download="{{slug}}.mp3">Download MP3</a> &middot; <a href="/">Convert another</a></p>
+{% if job.get('saved') %}<p class=muted>Saved to <a href="/library/{{job.saved}}">Library</a> as {{job.saved}}.</p>
+{% else %}<form method=post action="/job/{{id}}/save"><input type=hidden name=_csrf value="{{csrf}}"><button type=submit>Save to Library</button></form>{% endif %}
+{% else %}
+<p><b>Error.</b> {{job.get('error','unknown')}}</p><p><a href="/">Try again</a></p>
+{% endif %}"""
+
+LIB = """<h1><a href="/">lector</a></h1>
+<p class=sub>Library &middot; {{user}}'s saved narrations</p>
+{% if items %}{% for it in items %}
+<div style="margin:1.3rem 0">
+<b>{{it.title}}</b> <span class=muted>&middot; {{it.size}}</span><br>
+<audio id="lb{{loop.index}}" controls preload=none src="/library/{{it.name}}"></audio>
+<div class=skiprow><button type=button onclick="lskip('lb{{loop.index}}',-15)">&laquo; 15s</button><button type=button onclick="lskip('lb{{loop.index}}',15)">15s &raquo;</button></div>
+<a href="/library/{{it.name}}" download>Download</a>
+</div>
+{% endfor %}{% else %}<p class=muted>Nothing saved yet. Convert a document, then press "Save to Library" on the result.</p>{% endif %}
+<p><a href="/">Back</a></p>"""
+
+LOGIN = """<h1>lector</h1><p class=sub>Reads your documents aloud. Please sign in.</p>
+{% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
+<form method=post action="/login{{nextq}}">
+<input type=hidden name=_csrf value="{{csrf}}">
+<label for=u>Email</label><input id=u name=username type=email autocomplete=username autofocus>
+<label for=p>Password</label><input id=p name=password type=password autocomplete=current-password>
+<button type=submit>Sign in</button>
+</form>
+<p class=muted><a href="/forgot">Forgot password?</a></p>"""
+
+ACCOUNT = """<h1><a href="/">lector</a></h1><p class=sub>Account &middot; {{user}}</p>
+{% if msg %}<p style="color:#197">{{msg}}</p>{% endif %}{% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
+<form method=post action="/account">
+<input type=hidden name=_csrf value="{{csrf}}">
+<label for=c>Current password</label><input id=c name=current type=password autocomplete=current-password>
+<label for=n>New password</label><input id=n name=new type=password autocomplete=new-password>
+<button type=submit>Change password</button>
+</form>"""
+
+ADMIN = """<h1><a href="/">lector</a></h1><p class=sub>Admin &middot; accounts</p>
+{% if msg %}<p style="color:#197">{{msg}}</p>{% endif %}{% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
+<table class=u><tr><th>Email</th><th>Role</th><th></th></tr>
+{% for u,info in users.items() %}<tr><td>{{u}}</td><td>{{'admin' if info.admin else 'user'}}</td>
+<td>{% if u != user %}<form method=post action="/admin/delete" style="margin:0"><input type=hidden name=_csrf value="{{csrf}}"><input type=hidden name=username value="{{u}}"><button style="padding:.25rem .7rem;margin:0;font-size:.8rem;background:#8a1a1a">delete</button></form>{% endif %}</td></tr>{% endfor %}
+</table>
+<h2 style="font-size:1.1rem;margin-top:1.6rem">Add account</h2>
+<form method=post action="/admin/add">
+<input type=hidden name=_csrf value="{{csrf}}">
+<label for=nu>Email</label><input id=nu name=username type=email placeholder="name@example.com">
+<label style="font-weight:400"><input type=checkbox name=admin value=1 style="width:auto"> administrator</label>
+<button type=submit>Send invite</button>
+</form>"""
+
+
+FORGOT = """<h1>lector</h1><p class=sub>Reset your password</p>
+{% if sent %}<p>If an account exists for <b>{{email}}</b>, a password-reset link is on its way. Check your inbox.</p>
+<p class=muted><a href="/login">Back to sign in</a></p>
+{% else %}<form method=post action="/forgot"><input type=hidden name=_csrf value="{{csrf}}">
+<label for=e>Email</label><input id=e name=email type=email autocomplete=username autofocus>
+<button type=submit>Send reset link</button></form>
+<p class=muted><a href="/login">Back to sign in</a></p>{% endif %}"""
+
+RESET = """<h1>lector</h1><p class=sub>{{ 'Set your password' if kind=='invite' else 'Choose a new password' }}</p>
+{% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
+<p class=muted>For <b>{{email}}</b>.</p>
+<form method=post><input type=hidden name=_csrf value="{{csrf}}">
+<label for=p>New password</label><input id=p name=new type=password autocomplete=new-password autofocus>
+<button type=submit>{{ 'Set password' if kind=='invite' else 'Reset password' }}</button></form>"""
+
+RESET_BAD = """<h1>lector</h1><p class=sub>Link expired</p>
+<p>This link is invalid or has expired. <a href="/forgot">Request a new one</a>, or ask an administrator to re-send your invite.</p>"""
+
+RESET_DONE = """<h1>lector</h1><p class=sub>Password set</p><p>Your password is set. <a href="/login">Sign in</a>.</p>"""
+
+
+def render(body_tpl, title, **ctx):
+    body = render_template_string(body_tpl, user=current_user(), admin=is_admin(),
+                                  csrf=session.get("csrf", ""), **ctx)
+    return render_template_string(PAGE, title=title, model=MODEL, body=body,
+                                  user=current_user(), admin=is_admin())
+
+
+# --------------------------------------------------------------------------- gate
+PUBLIC = {"login", "healthz", "static", "forgot", "reset"}
+
+
+@app.before_request
+def gate():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(16)
+    if request.endpoint not in PUBLIC and not current_user():
+        nxt = request.full_path if request.method == "GET" else None
+        return redirect(url_for("login", next=nxt) if nxt else url_for("login"))
+    if request.method == "POST" and request.endpoint != "static":
+        if not request.form.get("_csrf") or request.form.get("_csrf") != session.get("csrf"):
+            abort(400)
+
+
+# ------------------------------------------------------------------------- auth
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    nxt = request.args.get("next") or "/"
+    if current_user():
+        return redirect("/")
+    error = None
+    if request.method == "POST":
+        users = load_users()
+        u = (request.form.get("username") or "").strip().lower()
+        info = users.get(u)
+        if info and check_password_hash(info["pw"], request.form.get("password") or ""):
+            session.permanent = True
+            session["user"] = u
+            session["csrf"] = secrets.token_urlsafe(16)
+            log(u, "-", "login", request.headers.get("X-Forwarded-For", "-"))
+            return redirect(nxt if nxt.startswith("/") else "/")
+        error = "Incorrect username or password."
+        log(u or "-", "-", "login-fail", "")
+    nq = ("?next=" + nxt) if nxt and nxt != "/" else ""
+    body = render_template_string(LOGIN, error=error, csrf=session.get("csrf"), nextq=nq)
+    return render_template_string(PAGE, title="lector - sign in", model=MODEL, body=body, user=None, admin=False)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/forgot", methods=["GET", "POST"])
+def forgot():
+    sent = False
+    email = ""
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        sent = True
+        if email in load_users():
+            link = f"{BASE_URL}/reset/{new_token(email, 'reset', 3600)}"
+            send_email(email, "Reset your lector password",
+                       "<p>We received a request to reset your lector password.</p>"
+                       f'<p><a href="{link}">Choose a new password</a>. This link expires in one hour.</p>'
+                       "<p>If you did not request this, you can ignore this email.</p>")
+        log(email or "-", "-", "reset-request", "")
+    return render(FORGOT, "lector - reset", sent=sent, email=email)
+
+
+@app.route("/reset/<token>", methods=["GET", "POST"])
+def reset(token):
+    entry = peek_token(token)
+    if not entry:
+        return render(RESET_BAD, "lector - link expired")
+    if request.method == "POST":
+        entry = pop_token(token)
+        if not entry:
+            return render(RESET_BAD, "lector - link expired")
+        new = request.form.get("new") or ""
+        if len(new) < 8:
+            return render(RESET, "lector - set password", kind=entry["kind"],
+                          email=entry["email"], error="Password must be at least 8 characters.")
+        with USER_LOCK:
+            users = load_users()
+            if entry["email"] in users:
+                users[entry["email"]]["pw"] = generate_password_hash(new)
+                save_users(users)
+        log(entry["email"], "-", "password-set", entry["kind"])
+        return render(RESET_DONE, "lector - done")
+    return render(RESET, "lector - set password", kind=entry["kind"], email=entry["email"], error=None)
+
+
+@app.route("/account", methods=["GET", "POST"])
+def account():
+    msg = error = None
+    if request.method == "POST":
+        users = load_users()
+        me = users[current_user()]
+        if not check_password_hash(me["pw"], request.form.get("current") or ""):
+            error = "Current password is incorrect."
+        elif len(request.form.get("new") or "") < 8:
+            error = "New password must be at least 8 characters."
+        else:
+            with USER_LOCK:
+                users = load_users()
+                users[current_user()]["pw"] = generate_password_hash(request.form["new"])
+                save_users(users)
+            log(current_user(), "-", "password-change", "")
+            msg = "Password changed."
+    return render(ACCOUNT, "lector - account", msg=msg, error=error)
+
+
+@app.route("/admin")
+def admin():
+    if not is_admin():
+        abort(403)
+    return render(ADMIN, "lector - admin", users=load_users(), msg=None, error=None)
+
+
+@app.route("/admin/add", methods=["POST"])
+def admin_add():
+    if not is_admin():
+        abort(403)
+    u = (request.form.get("username") or "").strip().lower()
+    error = msg = None
+    if not USERNAME_RE.match(u):
+        error = "Enter a valid email address."
+    elif u in load_users():
+        error = "That account already exists."
+    else:
+        with USER_LOCK:
+            users = load_users()
+            users[u] = {"pw": generate_password_hash(secrets.token_urlsafe(24)),
+                        "admin": bool(request.form.get("admin")),
+                        "created": datetime.date.today().isoformat()}
+            save_users(users)
+        user_lib(u)
+        link = f"{BASE_URL}/reset/{new_token(u, 'invite', 7 * 24 * 3600)}"
+        ok = send_email(u, "You've been invited to lector",
+                        "<p>An administrator created a lector account for you.</p>"
+                        f'<p><a href="{link}">Set your password</a>, then sign in at {BASE_URL}. '
+                        "This link expires in seven days.</p>")
+        log(current_user(), u, "account-create", "admin" if request.form.get("admin") else "user")
+        msg = (f"Created {u}. Invite emailed." if ok
+               else f"Created {u}, but the email failed - send them this link: {link}")
+    return render(ADMIN, "lector - admin", users=load_users(), msg=msg, error=error)
+
+
+@app.route("/admin/delete", methods=["POST"])
+def admin_delete():
+    if not is_admin():
+        abort(403)
+    u = (request.form.get("username") or "").strip().lower()
+    error = msg = None
+    if u == current_user():
+        error = "You cannot delete your own account."
+    elif u in load_users():
+        with USER_LOCK:
+            users = load_users()
+            users.pop(u, None)
+            save_users(users)
+        log(current_user(), u, "account-delete", "")
+        msg = f"Deleted account '{u}'. Their saved files remain on disk."
+    return render(ADMIN, "lector - admin", users=load_users(), msg=msg, error=error)
+
+
+# --------------------------------------------------------------------- conversion
+@app.route("/")
+def home():
+    return render(HOME, "lector", voices=VOICES)
+
+
+@app.route("/convert", methods=["POST"])
+def convert():
+    md = request.form.get("md", "")
+    up = request.files.get("file")
+    if up and up.filename:
+        md = up.read().decode("utf-8", "replace")
+    md = md.strip()
+    if not md:
+        return redirect(url_for("home"))
+    if len(md.encode("utf-8")) > MAX_INPUT:
+        return "Input too large (limit 400 KB).", 413
+    voice = request.form.get("voice", "onyx")
+    if voice not in VOICES:
+        voice = "onyx"
+    m = re.search(r"^#\s+(.+)$", md, re.M) or re.search(r"^(.{3,80})$", md, re.M)
+    title = (m.group(1).strip() if m else "Untitled document")
+    job_id = uuid.uuid4().hex
+    owner = current_user()
+    JOBS[job_id] = {"status": "queued", "title": title, "owner": owner,
+                    "created": time.time(), "done": 0, "total": None}
+    log(owner, title, "queued", f"{len(md.split())}w voice={voice}")
+    threading.Thread(target=run_job, args=(job_id, md, voice, title, owner), daemon=True).start()
+    return redirect(url_for("job_page", job_id=job_id))
+
+
+def owned_job(job_id):
+    job = JOBS.get(job_id)
+    if not job or (job.get("owner") != current_user() and not is_admin()):
+        abort(404)
+    return job
+
+
+@app.route("/job/<job_id>")
+def job_page(job_id):
+    job = owned_job(job_id)
+    pct = int(100 * job.get("done", 0) / (job.get("total") or 1)) if job["status"] == "running" else (100 if job["status"] == "done" else 0)
+    slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "lector"
+    resp = Response(render(JOB, "lector - " + job["title"][:40], job=job, id=job_id, pct=pct, slug=slug))
+    if job["status"] in ("queued", "running"):
+        resp.headers["Refresh"] = "4"
+    return resp
+
+
+@app.route("/job/<job_id>/audio")
+def job_audio(job_id):
+    job = owned_job(job_id)
+    if job.get("status") != "done":
+        abort(404)
+    slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "lector"
+    return send_file(job["file"], mimetype="audio/mpeg", download_name=slug + ".mp3",
+                     conditional=not app.config["USE_X_SENDFILE"])
+
+
+@app.route("/job/<job_id>/save", methods=["POST"])
+def job_save(job_id):
+    job = owned_job(job_id)
+    if job.get("status") != "done" or not os.path.isfile(job.get("file", "")):
+        abort(404)
+    if not job.get("saved"):
+        slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "narration"
+        lib = user_lib(current_user())
+        name = slug + ".mp3"
+        if os.path.exists(os.path.join(lib, name)):
+            name = f"{slug}-{job_id[:6]}.mp3"
+        shutil.copy2(job["file"], os.path.join(lib, name))
+        job["saved"] = name
+        log(current_user(), job["title"], "saved", name)
+    return redirect(url_for("library"))
+
+
+@app.route("/library")
+def library():
+    lib = user_lib(current_user())
+    items = []
+    for n in sorted(os.listdir(lib)):
+        if n.endswith(".mp3"):
+            mb = os.path.getsize(os.path.join(lib, n)) / 1048576
+            title = re.sub(r"[-_]+", " ", n[:-4]).strip().capitalize()
+            items.append({"name": n, "title": title, "size": f"{mb:.1f} MB"})
+    return render(LIB, "lector - library", items=items)
+
+
+@app.route("/library/<name>")
+def library_file(name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.mp3", name):
+        abort(404)
+    path = os.path.join(user_lib(current_user()), name)
+    if not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="audio/mpeg", conditional=not app.config["USE_X_SENDFILE"])
+
+
+@app.route("/sample/<voice>")
+def sample(voice):
+    if voice not in VOICES:
+        abort(404)
+    path = os.path.join(SAMPLES_DIR, voice + ".mp3")
+    if not os.path.exists(path):
+        abort(404)
+    return send_file(path, mimetype="audio/mpeg", conditional=not app.config["USE_X_SENDFILE"])
+
+
+@app.route("/about")
+def about():
+    return render(ABOUT, "lector - about")
+
+
+@app.route("/healthz")
+def healthz():
+    return "ok\n", 200
+
+
+ABOUT = """<h1><a href="/">lector</a></h1>
+<p class=sub>How it works, and the boundaries it keeps</p>
+<p>lector turns a markdown document into a narrated MP3. It cleans the markup first
+(links and raw URLs dropped, <code>&sect;102</code> read as "section 102", tables flattened
+into sentences), splits the text into chunks, sends each to OpenAI's text-to-speech
+API, and concatenates the audio.</p>
+<p>It is also a small, deliberate example of how an AI automation can be built so a
+person stays in command of it:</p>
+<ul>
+<li><b>Auth gate.</b> Every account is password-protected; passwords are stored only as
+salted hashes, and sessions are signed, HTTPS-only cookies.</li>
+<li><b>Secret isolation.</b> The OpenAI key lives only in this server process's
+environment - never in a page, never in the source repository, never sent to your browser.</li>
+<li><b>Bounded scope.</b> The only outbound call is to the text-to-speech API; input is
+size-capped; there is no shell and no arbitrary network access.</li>
+<li><b>Not delegated.</b> lector produces audio and stops. It does not email, publish,
+post, or act on your behalf.</li>
+<li><b>Traceability.</b> Every job and account action writes one audit line.</li>
+<li><b>Provenance honesty.</b> The voice is synthetic and the model vendor does not disclose
+its training data or the labor behind it; lector says so rather than passing the audio off as neutral.</li>
+</ul>
+<p><a href="/">Back</a></p>"""
+
+
+if __name__ == "__main__":
+    app.run("127.0.0.1", 3476, debug=True)

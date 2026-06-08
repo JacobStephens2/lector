@@ -1,0 +1,16 @@
+# Runtime state — secrets, accounts, tokens. NEVER commit.
+state/
+lector.log
+
+# User content — generated audio and per-user libraries.
+library/
+jobs/
+
+# Local environment
+.venv/
+__pycache__/
+*.pyc
+
+# Real env file (commit .env.example instead)
+.env
+*.env
