@@ -24,12 +24,22 @@ LOG_PATH = os.path.join(APP_DIR, "lector.log")
 for d in (JOBS_DIR, LIBRARY_DIR, STATE_DIR):
     os.makedirs(d, exist_ok=True)
 
-MODEL = "gpt-4o-mini-tts"
 CHUNK_LIMIT = 3600
 MAX_INPUT = 400 * 1024
-VOICES = ["onyx", "alloy", "nova", "shimmer", "sage", "fable", "echo"]
 INSTRUCTIONS = ("Read as a calm, measured, articulate audiobook narrator. "
                 "Natural pacing, clear diction, a short pause at each section heading.")
+
+# TTS backend. "kokoro" uses the local Kokoro-82M service (no third-party API);
+# "openai" uses the hosted gpt-4o-mini-tts. Flip LECTOR_TTS_BACKEND to switch.
+TTS_BACKEND = os.environ.get("LECTOR_TTS_BACKEND", "openai").lower()
+KOKORO_URL = os.environ.get("KOKORO_URL", "http://127.0.0.1:3477/tts")
+OPENAI_MODEL = "gpt-4o-mini-tts"
+OPENAI_VOICES = ["onyx", "alloy", "nova", "shimmer", "sage", "fable", "echo"]
+KOKORO_VOICES = ["af_heart", "am_michael", "af_bella", "am_adam", "bf_emma", "bm_george", "af_nicole"]
+if TTS_BACKEND == "kokoro":
+    VOICES, DEFAULT_VOICE, MODEL = KOKORO_VOICES, "af_heart", "Kokoro-82M (local, ONNX)"
+else:
+    VOICES, DEFAULT_VOICE, MODEL = OPENAI_VOICES, "onyx", OPENAI_MODEL
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 TOKENS_PATH = os.path.join(STATE_DIR, "tokens.json")
 BASE_URL = os.environ.get("LECTOR_BASE_URL", "https://lector.stephens.page")
@@ -211,12 +221,9 @@ def chunk(text, limit=CHUNK_LIMIT):
     return chunks
 
 
-def tts(text, voice):
-    body = json.dumps({"model": MODEL, "voice": voice, "input": text,
-                       "instructions": INSTRUCTIONS}).encode()
-    req = urllib.request.Request("https://api.openai.com/v1/audio/speech", data=body,
-                                 headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
-                                          "Content-Type": "application/json"})
+def _post(url, body, headers, label):
+    """POST and return the response bytes, retrying a few times with backoff."""
+    req = urllib.request.Request(url, data=body, headers=headers)
     last = None
     for attempt in range(4):
         try:
@@ -225,7 +232,24 @@ def tts(text, voice):
         except Exception as e:
             last = e
             time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"TTS failed: {last}")
+    raise RuntimeError(f"{label} failed: {last}")
+
+
+def tts_openai(text, voice):
+    body = json.dumps({"model": OPENAI_MODEL, "voice": voice, "input": text,
+                       "instructions": INSTRUCTIONS}).encode()
+    return _post("https://api.openai.com/v1/audio/speech", body,
+                 {"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+                  "Content-Type": "application/json"}, "OpenAI TTS")
+
+
+def tts_kokoro(text, voice):
+    body = json.dumps({"text": text, "voice": voice}).encode()
+    return _post(KOKORO_URL, body, {"Content-Type": "application/json"}, "Kokoro TTS")
+
+
+def tts(text, voice):
+    return tts_kokoro(text, voice) if TTS_BACKEND == "kokoro" else tts_openai(text, voice)
 
 
 def run_job(job_id, md, voice, title, owner):
@@ -287,9 +311,12 @@ pre.src{white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,Me
 {% else %}<span class=brand>lector</span>{% endif %}</nav>
 {{body|safe}}
 <footer>lector reads documents aloud and nothing else - it never sends, publishes, or
-posts anything. Audio is synthesized by OpenAI ({{model}}); the voices are synthetic and
-the model's training provenance is not disclosed by the vendor. The API key lives only in
-this server's environment. <a href="/about">How it works &amp; boundaries</a>.</footer>
+posts anything. {% if provider=='kokoro' %}Audio is synthesized on this server by Kokoro-82M
+(ONNX), an openly licensed model trained on documented public-domain and permissively licensed
+audio; the voices are synthetic and no audio leaves the server.{% else %}Audio is synthesized by
+OpenAI ({{model}}); the voices are synthetic and the model's training provenance is not disclosed
+by the vendor. The API key lives only in this server's environment.{% endif %}
+<a href="/about">How it works &amp; boundaries</a>.</footer>
 <script>function lskip(id,n){var a=document.getElementById(id);if(a){a.currentTime=Math.max(0,(a.currentTime||0)+n);}}</script>
 </body></html>"""
 
@@ -301,7 +328,7 @@ HOME = """<h1><a href="/">lector</a></h1>
 <textarea id=md name=md placeholder="# Paste markdown here, or choose a .md file below"></textarea>
 <div class=row>
 <div><label for=file>...or upload a file</label><input id=file type=file name=file accept=".md,.markdown,.txt"></div>
-<div><label for=voice>Voice</label><select id=voice name=voice>{% for v in voices %}<option{% if v=='onyx' %} selected{% endif %}>{{v}}</option>{% endfor %}</select></div>
+<div><label for=voice>Voice</label><select id=voice name=voice>{% for v in voices %}<option{% if v==default %} selected{% endif %}>{{v}}</option>{% endfor %}</select></div>
 </div>
 <label>Hear the voices</label>
 <div class=voicegrid>{% for v in voices %}<div class=vc><span>{{v}}</span><audio controls preload=none src="/sample/{{v}}"></audio></div>{% endfor %}</div>
@@ -398,9 +425,9 @@ RESET_DONE = """<h1>lector</h1><p class=sub>Password set</p><p>Your password is 
 
 def render(body_tpl, title, **ctx):
     body = render_template_string(body_tpl, user=current_user(), admin=is_admin(),
-                                  csrf=session.get("csrf", ""), **ctx)
+                                  provider=TTS_BACKEND, csrf=session.get("csrf", ""), **ctx)
     return render_template_string(PAGE, title=title, model=MODEL, body=body,
-                                  user=current_user(), admin=is_admin())
+                                  provider=TTS_BACKEND, user=current_user(), admin=is_admin())
 
 
 # --------------------------------------------------------------------------- gate
@@ -440,7 +467,8 @@ def login():
         log(u or "-", "-", "login-fail", "")
     nq = ("?next=" + nxt) if nxt and nxt != "/" else ""
     body = render_template_string(LOGIN, error=error, csrf=session.get("csrf"), nextq=nq)
-    return render_template_string(PAGE, title="lector - sign in", model=MODEL, body=body, user=None, admin=False)
+    return render_template_string(PAGE, title="lector - sign in", model=MODEL, body=body,
+                                  provider=TTS_BACKEND, user=None, admin=False)
 
 
 @app.route("/logout")
@@ -566,7 +594,7 @@ def admin_delete():
 # --------------------------------------------------------------------- conversion
 @app.route("/")
 def home():
-    return render(HOME, "lector", voices=VOICES)
+    return render(HOME, "lector", voices=VOICES, default=DEFAULT_VOICE)
 
 
 @app.route("/convert", methods=["POST"])
@@ -580,9 +608,9 @@ def convert():
         return redirect(url_for("home"))
     if len(md.encode("utf-8")) > MAX_INPUT:
         return "Input too large (limit 400 KB).", 413
-    voice = request.form.get("voice", "onyx")
+    voice = request.form.get("voice", DEFAULT_VOICE)
     if voice not in VOICES:
-        voice = "onyx"
+        voice = DEFAULT_VOICE
     m = re.search(r"^#\s+(.+)$", md, re.M) or re.search(r"^(.{3,80})$", md, re.M)
     title = (m.group(1).strip() if m else "Untitled document")
     job_id = uuid.uuid4().hex
@@ -700,13 +728,26 @@ ABOUT = """<h1><a href="/">lector</a></h1>
 <p class=sub>How it works, and the boundaries it keeps</p>
 <p>lector turns a markdown document into a narrated MP3. It cleans the markup first
 (links and raw URLs dropped, <code>&sect;102</code> read as "section 102", tables flattened
-into sentences), splits the text into chunks, sends each to OpenAI's text-to-speech
-API, and concatenates the audio.</p>
+into sentences), splits the text into chunks, sends each to {% if provider=='kokoro' %}a
+text-to-speech model running on this server{% else %}OpenAI's text-to-speech API{% endif %},
+and concatenates the audio.</p>
 <p>It is also a small, deliberate example of how an AI automation can be built so a
 person stays in command of it:</p>
 <ul>
 <li><b>Auth gate.</b> Every account is password-protected; passwords are stored only as
 salted hashes, and sessions are signed, HTTPS-only cookies.</li>
+{% if provider=='kokoro' %}
+<li><b>Secret isolation.</b> There is no third-party API key to protect: speech is synthesized
+on this server, so no credential and no audio ever leave it.</li>
+<li><b>Bounded scope.</b> The only outbound call is to a text-to-speech model running on this
+same machine; input is size-capped; there is no shell and no arbitrary network access.</li>
+<li><b>Not delegated.</b> lector produces audio and stops. It does not email, publish,
+post, or act on your behalf.</li>
+<li><b>Traceability.</b> Every job and account action writes one audit line.</li>
+<li><b>Provenance honesty.</b> The voice is synthetic, produced by Kokoro-82M - an openly
+licensed (Apache-2.0) model trained on documented public-domain and permissively licensed audio.
+lector can name what reads to you rather than passing the audio off as neutral.</li>
+{% else %}
 <li><b>Secret isolation.</b> The OpenAI key lives only in this server process's
 environment - never in a page, never in the source repository, never sent to your browser.</li>
 <li><b>Bounded scope.</b> The only outbound call is to the text-to-speech API; input is
@@ -716,6 +757,7 @@ post, or act on your behalf.</li>
 <li><b>Traceability.</b> Every job and account action writes one audit line.</li>
 <li><b>Provenance honesty.</b> The voice is synthetic and the model vendor does not disclose
 its training data or the labor behind it; lector says so rather than passing the audio off as neutral.</li>
+{% endif %}
 </ul>
 <p><a href="/">Back</a></p>"""
 

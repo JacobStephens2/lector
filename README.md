@@ -12,8 +12,11 @@ how to wrap an AI automation so a person stays in command of it.
 1. Cleans the markdown for the ear - drops links and raw URLs, reads `§102` as
    "section 102", flattens tables into sentences, expands a few acronyms.
 2. Splits the text into chunks under the TTS input limit.
-3. Sends each chunk to OpenAI text-to-speech (`gpt-4o-mini-tts`) and
-   concatenates the audio into one MP3.
+3. Sends each chunk to a text-to-speech backend and concatenates the audio into
+   one MP3. Two backends are supported, selected by `LECTOR_TTS_BACKEND`:
+   - `kokoro` - a local **Kokoro-82M** (ONNX) service on this machine, so no
+     audio or API key leaves the server (see `kokoro/`).
+   - `openai` (default) - the hosted `gpt-4o-mini-tts`.
 
 Jobs run in the background (a 10k-word document takes a few minutes), so the
 request never blocks on a long synthesis.
@@ -29,9 +32,10 @@ should be, so the same checklist is visible in something small:
 
 - **Auth gate** - the whole site is behind HTTP Basic auth at the Apache edge,
   over TLS.
-- **Secret isolation** - the OpenAI key is read from a systemd `EnvironmentFile`
-  (`/etc/lector/lector.env`, root-owned, outside the web root). It is never in
-  the page, never in this repository, never sent to the browser.
+- **Secret isolation** - with the hosted backend, the OpenAI key is read from a
+  systemd `EnvironmentFile` (`/etc/lector/lector.env`, root-owned, outside the web
+  root); it is never in the page, never in this repository, never sent to the
+  browser. With the Kokoro backend there is no third-party key at all.
 - **Bounded scope** - the only outbound call is to the TTS API; input is size-
   capped; there is no shell and no arbitrary network access.
 - **Not delegated** - lector produces audio and stops. It never sends, publishes,
