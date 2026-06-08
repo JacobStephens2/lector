@@ -30,16 +30,19 @@ to exactly what was read - readable inline or downloadable from the Library page
 This is a TTS toy, but it is built the way a revenue-critical AI automation
 should be, so the same checklist is visible in something small:
 
-- **Auth gate** - the whole site is behind HTTP Basic auth at the Apache edge,
-  over TLS.
+- **Auth gate** - every account signs in with an email and a salted-hash password;
+  sessions are signed, HTTPS-only cookies. Apache terminates TLS and reverse-proxies
+  to the app, which enforces the login itself - no unauthenticated request reaches a
+  page, except the share links you deliberately create.
 - **Secret isolation** - with the hosted backend, the OpenAI key is read from a
   systemd `EnvironmentFile` (`/etc/lector/lector.env`, root-owned, outside the web
   root); it is never in the page, never in this repository, never sent to the
   browser. With the Kokoro backend there is no third-party key at all.
 - **Bounded scope** - the only outbound call is to the TTS API; input is size-
   capped; there is no shell and no arbitrary network access.
-- **Not delegated** - lector produces audio and stops. It never sends, publishes,
-  posts, or acts on anyone's behalf.
+- **Not delegated** - lector produces audio and stops. It never acts on its own: it
+  does not email, post, or publish anything unless you deliberately create a share
+  link, which you control and can revoke.
 - **Traceability** - every job appends one audit line (time, user, title, outcome)
   to `lector.log`.
 - **Provenance honesty** - the `/about` page states that the voice is synthetic
@@ -52,12 +55,12 @@ should be, so the same checklist is visible in something small:
 python3 -m venv .venv
 .venv/bin/pip install flask waitress
 echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/lector/lector.env   # mode 640
-.venv/bin/waitress-serve --listen 127.0.0.1:3475 app:app
+.venv/bin/waitress-serve --listen 127.0.0.1:3476 app:app
 ```
 
-Apache reverse-proxies `lector.stephens.page` to `127.0.0.1:3475` and adds the
-Basic-auth gate and the `X-Remote-User` header. systemd (`lector.service`) keeps
-it running.
+Apache terminates TLS and reverse-proxies `lector.stephens.page` to
+`127.0.0.1:3476`; authentication is the app's own session login, not anything at
+the proxy. systemd (`lector.service`) keeps it running.
 
 ## Swapping the API key
 
