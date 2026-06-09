@@ -288,6 +288,23 @@ def default_voice_for(user):
     return OPENAI_DEFAULT if default_backend_for(user) == "openai" else KOKORO_DEFAULT
 
 
+def preferred_voice(user):
+    """The account's last-used voice if still available to it, else the default."""
+    pref = load_users().get(user, {}).get("last_voice")
+    return pref if pref in voices_for(user) else default_voice_for(user)
+
+
+def remember_voice(user, voice):
+    """Persist the account's voice choice for next time (no-op if unchanged)."""
+    if load_users().get(user, {}).get("last_voice") == voice:
+        return
+    with USER_LOCK:
+        users = load_users()
+        if user in users:
+            users[user]["last_voice"] = voice
+            save_users(users)
+
+
 def tts(text, voice):
     return tts_openai(text, voice) if backend_of_voice(voice) == "openai" else tts_kokoro(text, voice)
 
@@ -733,7 +750,7 @@ def admin_delete():
 @app.route("/")
 def home():
     u = current_user()
-    return render(HOME, "lector", groups=voice_groups_for(u), default=default_voice_for(u))
+    return render(HOME, "lector", groups=voice_groups_for(u), default=preferred_voice(u))
 
 
 @app.route("/convert", methods=["POST"])
@@ -751,6 +768,7 @@ def convert():
     voice = request.form.get("voice", default_voice_for(owner))
     if voice not in voices_for(owner):   # enforce: unauthorized accounts can't pick OpenAI voices
         voice = default_voice_for(owner)
+    remember_voice(owner, voice)         # preselect this voice next time
     m = re.search(r"^#\s+(.+)$", md, re.M) or re.search(r"^(.{3,80})$", md, re.M)
     title = (m.group(1).strip() if m else "Untitled document")
     job_id = uuid.uuid4().hex
