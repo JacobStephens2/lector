@@ -272,9 +272,9 @@ def voices_for(user):
 
 
 def voice_groups_for(user):
-    groups = [("Local - Kokoro-82M, on this server (free)", KOKORO_VOICES)]
+    groups = [("Kokoro-82M - runs locally on this server (free)", KOKORO_VOICES)]
     if may_use_openai(user):
-        groups.append(("OpenAI - hosted, uses API credits", OPENAI_VOICES))
+        groups.append(("OpenAI " + OPENAI_MODEL + " - hosted, uses API credits", OPENAI_VOICES))
     return groups
 
 
@@ -342,6 +342,7 @@ footer{margin-top:2.5rem;border-top:1px solid #e3e3e3;padding-top:1rem;color:#77
 audio{width:100%;margin:.6rem 0 .2rem}
 .skiprow{display:flex;gap:.5rem;margin:0 0 .4rem}
 .skiprow button{margin:0;padding:.3rem .8rem;font-size:.85rem;background:#eef1f4;color:#13314d;border:1px solid #cdd6df}
+.voicegroup{font-weight:600;font-size:.82rem;color:#444;margin:.9rem 0 .15rem}
 .voicegrid{display:flex;flex-wrap:wrap;gap:.7rem;margin:.3rem 0}
 .vc{display:flex;flex-direction:column;gap:.2rem;font-size:.8rem;color:#555}.vc audio{width:12.5rem;height:2.2rem;margin:0}
 table.u{border-collapse:collapse;width:100%}table.u td,table.u th{border-bottom:1px solid #e3e3e3;text-align:left;padding:.4rem .3rem;font-size:.95rem}
@@ -376,7 +377,9 @@ HOME = """<h1><a href="/">lector</a></h1>
 <div><label for=voice>Voice</label><select id=voice name=voice>{% for label, vs in groups %}<optgroup label="{{label}}">{% for v in vs %}<option{% if v==default %} selected{% endif %}>{{v}}</option>{% endfor %}</optgroup>{% endfor %}</select></div>
 </div>
 <label>Hear the voices</label>
-<div class=voicegrid>{% for v in voices %}<div class=vc><span>{{v}}</span><audio controls preload=none src="/sample/{{v}}"></audio></div>{% endfor %}</div>
+{% for label, vs in groups %}<div class=voicegroup>{{label}}</div>
+<div class=voicegrid>{% for v in vs %}<div class=vc><span>{{v}}</span><audio controls preload=none src="/sample/{{v}}"></audio></div>{% endfor %}</div>
+{% endfor %}
 <button type=submit>Convert to audio</button>
 </form>
 <p class=muted style=margin-top:1.4rem>Citations like <code>&sect;102</code> are read as "section 102"; tables are read as plain sentences; links and raw URLs are dropped.</p>"""
@@ -663,8 +666,7 @@ def admin_delete():
 @app.route("/")
 def home():
     u = current_user()
-    return render(HOME, "lector", voices=voices_for(u), groups=voice_groups_for(u),
-                  default=default_voice_for(u))
+    return render(HOME, "lector", groups=voice_groups_for(u), default=default_voice_for(u))
 
 
 @app.route("/convert", methods=["POST"])
