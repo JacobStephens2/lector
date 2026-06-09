@@ -29,17 +29,22 @@ MAX_INPUT = 400 * 1024
 INSTRUCTIONS = ("Read as a calm, measured, articulate audiobook narrator. "
                 "Natural pacing, clear diction, a short pause at each section heading.")
 
-# TTS backend. "kokoro" uses the local Kokoro-82M service (no third-party API);
-# "openai" uses the hosted gpt-4o-mini-tts. Flip LECTOR_TTS_BACKEND to switch.
+# TTS backends. Kokoro-82M runs locally (no third-party API, no cost). The hosted
+# OpenAI gpt-4o-mini-tts bills per call, so it is gated to an allowlist of accounts
+# (see may_use_openai); everyone else can only use Kokoro and never incurs charges.
+# LECTOR_TTS_BACKEND is the site default backend ("kokoro" or "openai").
 TTS_BACKEND = os.environ.get("LECTOR_TTS_BACKEND", "openai").lower()
 KOKORO_URL = os.environ.get("KOKORO_URL", "http://127.0.0.1:3477/tts")
 OPENAI_MODEL = "gpt-4o-mini-tts"
+KOKORO_MODEL_LABEL = "Kokoro-82M (local, ONNX)"
 OPENAI_VOICES = ["onyx", "alloy", "nova", "shimmer", "sage", "fable", "echo"]
 KOKORO_VOICES = ["af_heart", "am_michael", "af_bella", "am_adam", "bf_emma", "bm_george", "af_nicole"]
-if TTS_BACKEND == "kokoro":
-    VOICES, DEFAULT_VOICE, MODEL = KOKORO_VOICES, "af_heart", "Kokoro-82M (local, ONNX)"
-else:
-    VOICES, DEFAULT_VOICE, MODEL = OPENAI_VOICES, "onyx", OPENAI_MODEL
+ALL_VOICES = KOKORO_VOICES + OPENAI_VOICES
+KOKORO_DEFAULT, OPENAI_DEFAULT = "af_heart", "onyx"
+# Accounts allowed to use the paid OpenAI backend. Empty/unset => unrestricted
+# (any account may use it); a comma-separated list => only those accounts may.
+_oa = os.environ.get("LECTOR_OPENAI_ALLOWED", "").strip()
+OPENAI_ALLOWED = {e.strip().lower() for e in _oa.split(",") if e.strip()} if _oa else None
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 TOKENS_PATH = os.path.join(STATE_DIR, "tokens.json")
 SHARES_PATH = os.path.join(STATE_DIR, "shares.json")
@@ -250,14 +255,48 @@ def tts_kokoro(text, voice):
     return _post(KOKORO_URL, body, {"Content-Type": "application/json"}, "Kokoro TTS")
 
 
+def backend_of_voice(voice):
+    return "openai" if voice in OPENAI_VOICES else "kokoro"
+
+
+def may_use_openai(user):
+    """Whether this account may use the paid OpenAI backend."""
+    if "OPENAI_API_KEY" not in os.environ:
+        return False
+    return OPENAI_ALLOWED is None or (user or "").lower() in OPENAI_ALLOWED
+
+
+def voices_for(user):
+    """Voices this user may pick: Kokoro for all; OpenAI only if allowed."""
+    return KOKORO_VOICES + (OPENAI_VOICES if may_use_openai(user) else [])
+
+
+def voice_groups_for(user):
+    groups = [("Local - Kokoro-82M, on this server (free)", KOKORO_VOICES)]
+    if may_use_openai(user):
+        groups.append(("OpenAI - hosted, uses API credits", OPENAI_VOICES))
+    return groups
+
+
+def default_backend_for(user):
+    """The site default backend if this user may use it, else Kokoro."""
+    return "openai" if (TTS_BACKEND == "openai" and may_use_openai(user)) else "kokoro"
+
+
+def default_voice_for(user):
+    return OPENAI_DEFAULT if default_backend_for(user) == "openai" else KOKORO_DEFAULT
+
+
 def tts(text, voice):
-    return tts_kokoro(text, voice) if TTS_BACKEND == "kokoro" else tts_openai(text, voice)
+    return tts_openai(text, voice) if backend_of_voice(voice) == "openai" else tts_kokoro(text, voice)
 
 
 def run_job(job_id, md, voice, title, owner):
     job = JOBS[job_id]
     started = time.time()
     try:
+        if backend_of_voice(voice) == "openai" and not may_use_openai(owner):
+            voice = KOKORO_DEFAULT  # safety: never bill OpenAI for an unauthorized account
         text = clean_markdown(md)
         chunks = chunk(text)
         job.update(status="running", total=len(chunks), done=0, words=len(text.split()))
@@ -316,9 +355,10 @@ pre.src{white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,Me
 {{body|safe}}
 <footer>lector reads documents aloud - it never emails, posts, or acts on your behalf; the only
 thing it makes public is a share link you create yourself, which you can revoke.
-{% if provider=='kokoro' %}Audio is synthesized on this server by Kokoro-82M
+{% if provider=='kokoro' %}By default, audio is synthesized on this server by Kokoro-82M
 (ONNX), an openly licensed model trained on documented public-domain and permissively licensed
-audio; the voices are synthetic and no audio leaves the server.{% else %}Audio is synthesized by
+audio; those voices are synthetic and never leave the server.{% if may_openai %} OpenAI voices are
+also available to your account and send text to OpenAI's hosted API (billable).{% endif %}{% else %}Audio is synthesized by
 OpenAI ({{model}}); the voices are synthetic and the model's training provenance is not disclosed
 by the vendor. The API key lives only in this server's environment.{% endif %}
 <a href="/about">How it works &amp; boundaries</a>.</footer>
@@ -333,7 +373,7 @@ HOME = """<h1><a href="/">lector</a></h1>
 <textarea id=md name=md placeholder="# Paste markdown here, or choose a .md file below"></textarea>
 <div class=row>
 <div><label for=file>...or upload a file</label><input id=file type=file name=file accept=".md,.markdown,.txt"></div>
-<div><label for=voice>Voice</label><select id=voice name=voice>{% for v in voices %}<option{% if v==default %} selected{% endif %}>{{v}}</option>{% endfor %}</select></div>
+<div><label for=voice>Voice</label><select id=voice name=voice>{% for label, vs in groups %}<optgroup label="{{label}}">{% for v in vs %}<option{% if v==default %} selected{% endif %}>{{v}}</option>{% endfor %}</optgroup>{% endfor %}</select></div>
 </div>
 <label>Hear the voices</label>
 <div class=voicegrid>{% for v in voices %}<div class=vc><span>{{v}}</span><audio controls preload=none src="/sample/{{v}}"></audio></div>{% endfor %}</div>
@@ -447,10 +487,12 @@ RESET_DONE = """<h1>lector</h1><p class=sub>Password set</p><p>Your password is 
 
 
 def render(body_tpl, title, **ctx):
-    body = render_template_string(body_tpl, user=current_user(), admin=is_admin(),
-                                  provider=TTS_BACKEND, csrf=session.get("csrf", ""), **ctx)
-    return render_template_string(PAGE, title=title, model=MODEL, body=body,
-                                  provider=TTS_BACKEND, user=current_user(), admin=is_admin())
+    u = current_user()
+    provider = default_backend_for(u)
+    model = OPENAI_MODEL if provider == "openai" else KOKORO_MODEL_LABEL
+    common = dict(provider=provider, may_openai=may_use_openai(u), user=u, admin=is_admin())
+    body = render_template_string(body_tpl, csrf=session.get("csrf", ""), **common, **ctx)
+    return render_template_string(PAGE, title=title, model=model, body=body, **common)
 
 
 # --------------------------------------------------------------------------- gate
@@ -491,8 +533,10 @@ def login():
         log(u or "-", "-", "login-fail", "")
     nq = ("?next=" + nxt) if nxt and nxt != "/" else ""
     body = render_template_string(LOGIN, error=error, csrf=session.get("csrf"), nextq=nq)
-    return render_template_string(PAGE, title="lector - sign in", model=MODEL, body=body,
-                                  provider=TTS_BACKEND, user=None, admin=False)
+    prov = default_backend_for(None)
+    mdl = OPENAI_MODEL if prov == "openai" else KOKORO_MODEL_LABEL
+    return render_template_string(PAGE, title="lector - sign in", model=mdl, body=body,
+                                  provider=prov, may_openai=False, user=None, admin=False)
 
 
 @app.route("/logout")
@@ -618,7 +662,9 @@ def admin_delete():
 # --------------------------------------------------------------------- conversion
 @app.route("/")
 def home():
-    return render(HOME, "lector", voices=VOICES, default=DEFAULT_VOICE)
+    u = current_user()
+    return render(HOME, "lector", voices=voices_for(u), groups=voice_groups_for(u),
+                  default=default_voice_for(u))
 
 
 @app.route("/convert", methods=["POST"])
@@ -632,13 +678,13 @@ def convert():
         return redirect(url_for("home"))
     if len(md.encode("utf-8")) > MAX_INPUT:
         return "Input too large (limit 400 KB).", 413
-    voice = request.form.get("voice", DEFAULT_VOICE)
-    if voice not in VOICES:
-        voice = DEFAULT_VOICE
+    owner = current_user()
+    voice = request.form.get("voice", default_voice_for(owner))
+    if voice not in voices_for(owner):   # enforce: unauthorized accounts can't pick OpenAI voices
+        voice = default_voice_for(owner)
     m = re.search(r"^#\s+(.+)$", md, re.M) or re.search(r"^(.{3,80})$", md, re.M)
     title = (m.group(1).strip() if m else "Untitled document")
     job_id = uuid.uuid4().hex
-    owner = current_user()
     JOBS[job_id] = {"status": "queued", "title": title, "owner": owner,
                     "created": time.time(), "done": 0, "total": None, "md": md}
     log(owner, title, "queued", f"{len(md.split())}w voice={voice}")
@@ -847,7 +893,7 @@ def share_text(token):
 
 @app.route("/sample/<voice>")
 def sample(voice):
-    if voice not in VOICES:
+    if voice not in ALL_VOICES:
         abort(404)
     path = os.path.join(SAMPLES_DIR, voice + ".mp3")
     if not os.path.exists(path):

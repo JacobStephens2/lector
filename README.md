@@ -18,6 +18,12 @@ how to wrap an AI automation so a person stays in command of it.
      audio or API key leaves the server (see `kokoro/`).
    - `openai` (default) - the hosted `gpt-4o-mini-tts`.
 
+   The OpenAI backend bills per call, so it is gated by `LECTOR_OPENAI_ALLOWED`
+   (comma-separated accounts). Listed accounts may pick OpenAI voices; everyone
+   else is limited to the local Kokoro backend and can never incur API charges.
+   Unset means no restriction. The limit is enforced server-side, so a forged
+   request still cannot bill OpenAI for an account that is not on the list.
+
 Jobs run in the background (a 10k-word document takes a few minutes), so the
 request never blocks on a long synthesis.
 
@@ -55,6 +61,7 @@ should be, so the same checklist is visible in something small:
 python3 -m venv .venv
 .venv/bin/pip install flask waitress
 echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/lector/lector.env   # mode 640
+echo 'LECTOR_OPENAI_ALLOWED=you@example.com' | sudo tee -a /etc/lector/lector.env  # who may use the paid backend
 .venv/bin/waitress-serve --listen 127.0.0.1:3476 app:app
 ```
 
