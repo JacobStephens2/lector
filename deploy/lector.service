@@ -1,0 +1,35 @@
+# /etc/systemd/system/lector.service
+# Install with:
+#   sudo cp deploy/lector.service /etc/systemd/system/lector.service
+#   sudo systemctl daemon-reload && sudo systemctl restart lector
+[Unit]
+Description=lector (markdown to speech) - stephens.page
+After=network.target
+
+[Service]
+Type=simple
+User=lector
+Group=lector
+WorkingDirectory=/var/www/lector.stephens.page
+EnvironmentFile=/etc/lector/lector.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Resume interrupted jobs on startup. Only the real service sets this, so a test
+# import of app.py never re-spawns workers.
+Environment=LECTOR_RESUME=1
+ExecStart=/var/www/lector.stephens.page/.venv/bin/waitress-serve --listen 127.0.0.1:3476 --threads 24 --channel-timeout 30 app:app
+Restart=on-failure
+RestartSec=5
+
+# hardening (dedicated service user)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/www/lector.stephens.page
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

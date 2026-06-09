@@ -74,6 +74,38 @@ USER_LOCK = threading.Lock()
 SHARE_LOCK = threading.Lock()
 
 
+# ----------------------------------------------------------------- job persistence
+# Each job mirrors its state to disk so a restart or crash does not lose it:
+#   <id>.json    lightweight state (status, progress, byte offset, ...)
+#   <id>.md.src  the source text, written once
+#   <id>.mp3     the partial/finished audio, fsync'd at each chunk boundary
+# Interrupted (queued/running) jobs resume from the last completed chunk on start.
+PERSIST_KEYS = ("status", "title", "owner", "voice", "limit", "total", "done",
+                "bytes", "words", "notify", "created", "secs", "saved", "file", "error")
+
+
+def persist_job(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return
+    data = {k: job[k] for k in PERSIST_KEYS if k in job}
+    p = os.path.join(JOBS_DIR, job_id + ".json")
+    try:
+        with open(p + ".tmp", "w") as f:
+            json.dump(data, f)
+        os.replace(p + ".tmp", p)
+    except OSError:
+        pass
+
+
+def remove_job_files(job_id):
+    for ext in (".json", ".md.src", ".mp3"):
+        try:
+            os.remove(os.path.join(JOBS_DIR, job_id + ext))
+        except OSError:
+            pass
+
+
 # ----------------------------------------------------------------------- accounts
 def load_users():
     try:
@@ -333,40 +365,63 @@ def save_to_library(job, owner, job_id):
     return name
 
 
-def run_job(job_id, md, voice, title, owner):
+def run_job(job_id, md, voice, title, owner, resume=False):
     # Runs in a detached daemon thread, so it continues after the user leaves the
-    # job page. It stops early if the owner sets job["cancel"], and (when the job
-    # was started with "notify") it saves the result and emails the owner a link.
+    # job page. Progress is fsync'd and mirrored to disk after every chunk, so an
+    # interrupted job resumes from the last completed chunk on the next startup.
+    # It stops early if the owner sets job["cancel"]; when started with "notify"
+    # it saves the result and emails the owner a link.
     job = JOBS[job_id]
     started = time.time()
     try:
         if backend_of_voice(voice) == "openai" and not may_use_openai(owner):
             voice = KOKORO_DEFAULT  # safety: never bill OpenAI for an unauthorized account
         text = clean_markdown(md)
-        limit = KOKORO_CHUNK_LIMIT if backend_of_voice(voice) == "kokoro" else CHUNK_LIMIT
+        limit = job.get("limit") or (KOKORO_CHUNK_LIMIT if backend_of_voice(voice) == "kokoro" else CHUNK_LIMIT)
         chunks = chunk(text, limit)
-        job.update(status="running", total=len(chunks), done=0, words=len(text.split()))
+        total = len(chunks)
         out_path = os.path.join(JOBS_DIR, job_id + ".mp3")
+        start_i = job.get("done", 0) if resume else 0
+        if resume and 0 < start_i <= total and os.path.isfile(out_path):
+            f = open(out_path, "r+b")          # continue the existing partial file
+            f.truncate(job.get("bytes", 0))    # drop any half-written trailing chunk
+            f.seek(job.get("bytes", 0))
+        else:
+            start_i = 0
+            f = open(out_path, "wb")           # fresh, or partial file was lost
+            job["bytes"] = 0
+        job.update(status="running", total=total, done=start_i, voice=voice, limit=limit,
+                   words=job.get("words") or len(text.split()))
+        persist_job(job_id)
         cancelled = False
-        with open(out_path, "wb") as f:
-            for i, c in enumerate(chunks, 1):
+        try:
+            for i in range(start_i, total):
                 if job.get("cancel"):
                     cancelled = True
                     break
-                f.write(tts(c, voice))
-                job["done"] = i
+                f.write(tts(chunks[i], voice))
+                f.flush()
+                os.fsync(f.fileno())
+                job["done"] = i + 1
+                job["bytes"] = f.tell()
+                persist_job(job_id)
+        finally:
+            f.close()
         if cancelled:
+            job.update(status="stopped", secs=round(time.time() - started))
+            persist_job(job_id)
             try:
                 os.remove(out_path)
             except OSError:
                 pass
-            job.update(status="stopped", secs=round(time.time() - started))
-            log(owner, title, "stopped", f"{job.get('done', 0)}/{len(chunks)}ch")
+            log(owner, title, "stopped", f"{job.get('done', 0)}/{total}ch")
             return
         job.update(status="done", file=out_path, secs=round(time.time() - started))
-        log(owner, title, "done", f"{job['words']}w/{len(chunks)}ch/{job['secs']}s")
+        persist_job(job_id)
+        log(owner, title, "done", f"{job['words']}w/{total}ch/{job['secs']}s")
         if job.get("notify"):
             saved = save_to_library(job, owner, job_id)   # durable target for the email link
+            persist_job(job_id)
             link = f"{BASE_URL}/library/{saved}" if saved else f"{BASE_URL}/job/{job_id}"
             send_email(owner, f'lector: "{title}" is ready',
                        f"<p>Your narration <b>{_h(title)}</b> is ready "
@@ -374,6 +429,7 @@ def run_job(job_id, md, voice, title, owner):
                        f'<p><a href="{link}">Listen in your Library</a>.</p>')
     except Exception as e:
         job.update(status="error", error=str(e))
+        persist_job(job_id)
         log(owner, title, "error", str(e)[:200])
         if job.get("notify"):
             send_email(owner, f'lector: "{title}" could not be completed',
@@ -772,9 +828,16 @@ def convert():
     m = re.search(r"^#\s+(.+)$", md, re.M) or re.search(r"^(.{3,80})$", md, re.M)
     title = (m.group(1).strip() if m else "Untitled document")
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"status": "queued", "title": title, "owner": owner,
-                    "created": time.time(), "done": 0, "total": None, "md": md,
-                    "notify": bool(request.form.get("notify"))}
+    limit = KOKORO_CHUNK_LIMIT if backend_of_voice(voice) == "kokoro" else CHUNK_LIMIT
+    JOBS[job_id] = {"status": "queued", "title": title, "owner": owner, "voice": voice,
+                    "limit": limit, "created": time.time(), "done": 0, "total": None,
+                    "md": md, "notify": bool(request.form.get("notify"))}
+    try:
+        with open(os.path.join(JOBS_DIR, job_id + ".md.src"), "w", encoding="utf-8") as f:
+            f.write(md)
+    except OSError:
+        pass
+    persist_job(job_id)
     log(owner, title, "queued", f"{len(md.split())}w voice={voice}")
     threading.Thread(target=run_job, args=(job_id, md, voice, title, owner), daemon=True).start()
     return redirect(url_for("job_page", job_id=job_id))
@@ -814,6 +877,7 @@ def job_save(job_id):
     if job.get("status") != "done" or not os.path.isfile(job.get("file", "")):
         abort(404)
     save_to_library(job, job["owner"], job_id)
+    persist_job(job_id)
     return redirect(url_for("library"))
 
 
@@ -1039,6 +1103,50 @@ its training data or the labor behind it; lector says so rather than passing the
 {% endif %}
 </ul>
 <p><a href="/">Back</a></p>"""
+
+
+def resume_jobs():
+    """On startup: reload persisted jobs, prune old finished ones, and resume any
+    that were interrupted (queued/running) from their last completed chunk."""
+    now = time.time()
+    for fn in sorted(os.listdir(JOBS_DIR)):
+        if not fn.endswith(".json"):
+            continue
+        job_id = fn[:-5]
+        try:
+            data = json.load(open(os.path.join(JOBS_DIR, fn)))
+        except Exception:
+            continue
+        if data.get("status") in ("done", "error", "stopped"):
+            if now - data.get("created", now) > 7 * 86400:
+                remove_job_files(job_id)          # prune finished jobs after a week
+            else:
+                JOBS[job_id] = data               # keep viewable across restarts
+            continue
+        src = os.path.join(JOBS_DIR, job_id + ".md.src")
+        if not os.path.isfile(src):
+            data.update(status="error", error="interrupted; source text unavailable")
+            JOBS[job_id] = data
+            persist_job(job_id)
+            continue
+        try:
+            md = open(src, encoding="utf-8").read()
+        except OSError:
+            continue
+        data["md"] = md
+        JOBS[job_id] = data
+        log(data.get("owner"), data.get("title", "?"), "resumed",
+            f"{data.get('done', 0)}/{data.get('total', '?')}ch")
+        threading.Thread(target=run_job,
+                         args=(job_id, md, data.get("voice", KOKORO_DEFAULT),
+                               data.get("title", "Untitled"), data.get("owner")),
+                         kwargs={"resume": True}, daemon=True).start()
+
+
+# Only the real service sets LECTOR_RESUME=1 (see deploy/lector.service), so a
+# test import of this module never re-spawns workers for in-flight jobs.
+if os.environ.get("LECTOR_RESUME") == "1":
+    resume_jobs()
 
 
 if __name__ == "__main__":
