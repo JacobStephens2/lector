@@ -291,7 +291,34 @@ def tts(text, voice):
     return tts_openai(text, voice) if backend_of_voice(voice) == "openai" else tts_kokoro(text, voice)
 
 
+def _h(s):
+    """Minimal HTML escape for values interpolated into emails."""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def save_to_library(job, owner, job_id):
+    """Copy a finished job's audio (and source text) into the owner's Library."""
+    if job.get("saved") or not os.path.isfile(job.get("file", "")):
+        return job.get("saved")
+    slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "narration"
+    lib = user_lib(owner)
+    name = slug + ".mp3"
+    if os.path.exists(os.path.join(lib, name)):
+        name = f"{slug}-{job_id[:6]}.mp3"
+    shutil.copy2(job["file"], os.path.join(lib, name))
+    src = job.get("md", "")
+    if src:
+        with open(os.path.join(lib, name[:-4] + ".md"), "w", encoding="utf-8") as f:
+            f.write(src)
+    job["saved"] = name
+    log(owner, job["title"], "saved", name)
+    return name
+
+
 def run_job(job_id, md, voice, title, owner):
+    # Runs in a detached daemon thread, so it continues after the user leaves the
+    # job page. It stops early if the owner sets job["cancel"], and (when the job
+    # was started with "notify") it saves the result and emails the owner a link.
     job = JOBS[job_id]
     started = time.time()
     try:
@@ -301,15 +328,38 @@ def run_job(job_id, md, voice, title, owner):
         chunks = chunk(text)
         job.update(status="running", total=len(chunks), done=0, words=len(text.split()))
         out_path = os.path.join(JOBS_DIR, job_id + ".mp3")
+        cancelled = False
         with open(out_path, "wb") as f:
             for i, c in enumerate(chunks, 1):
+                if job.get("cancel"):
+                    cancelled = True
+                    break
                 f.write(tts(c, voice))
                 job["done"] = i
+        if cancelled:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            job.update(status="stopped", secs=round(time.time() - started))
+            log(owner, title, "stopped", f"{job.get('done', 0)}/{len(chunks)}ch")
+            return
         job.update(status="done", file=out_path, secs=round(time.time() - started))
         log(owner, title, "done", f"{job['words']}w/{len(chunks)}ch/{job['secs']}s")
+        if job.get("notify"):
+            saved = save_to_library(job, owner, job_id)   # durable target for the email link
+            link = f"{BASE_URL}/library/{saved}" if saved else f"{BASE_URL}/job/{job_id}"
+            send_email(owner, f'lector: "{title}" is ready',
+                       f"<p>Your narration <b>{_h(title)}</b> is ready "
+                       f"({job['words']} words, synthesized in {job['secs']}s).</p>"
+                       f'<p><a href="{link}">Listen in your Library</a>.</p>')
     except Exception as e:
         job.update(status="error", error=str(e))
         log(owner, title, "error", str(e)[:200])
+        if job.get("notify"):
+            send_email(owner, f'lector: "{title}" could not be completed',
+                       f"<p>Sorry - synthesizing <b>{_h(title)}</b> did not finish.</p>"
+                       f'<p>You can <a href="{BASE_URL}/">try again</a>.</p>')
 
 
 def log(who, title, status, detail):
@@ -389,6 +439,7 @@ HOME = """<h1><a href="/">lector</a></h1>
 {% for label, vs in groups %}<div class=voicegroup>{{label}}</div>
 <div class=voicegrid>{% for v in vs %}<div class=vc><span>{{v}}</span><audio controls preload=none src="/sample/{{v}}"></audio></div>{% endfor %}</div>
 {% endfor %}
+<label style="font-weight:400;display:flex;align-items:center;gap:.5rem;margin-top:1.1rem"><input type=checkbox name=notify value=1 checked style="width:auto;margin:0"> Email me a link when it's ready (it runs on the server, so you can close this page)</label>
 <button type=submit>Convert to audio</button>
 </form>
 <p class=muted style=margin-top:1.4rem>Citations like <code>&sect;102</code> are read as "section 102"; tables are read as plain sentences; links and raw URLs are dropped.</p>"""
@@ -399,7 +450,12 @@ JOB = """<h1><a href="/">lector</a></h1>
 <p><b>Synthesizing...</b> {{job.get('done',0)}} / {{job.get('total','?')}} chunks
 {% if job.get('words') %}({{job.words}} words){% endif %}</p>
 <div class=bar><i style="width:{{pct}}%"></i></div>
-<p class=muted>This page refreshes every few seconds. A long document (10k+ words) takes a few minutes.</p>
+<p class=muted>This runs on the server. {% if job.get('notify') %}You can close this page - we'll email {{user}} a link when it's ready.{% else %}It keeps running if you close this page; reopen this URL to check on it.{% endif %}</p>
+{% if job.get('cancel') %}<p class=muted>Stopping after the current chunk...</p>
+{% else %}<form method=post action="/job/{{id}}/stop"><input type=hidden name=_csrf value="{{csrf}}"><button class=linkbtn type=submit>Stop synthesis</button></form>{% endif %}
+{% elif job.status=='stopped' %}
+<p><b>Stopped.</b> You stopped this synthesis{% if job.get('total') %} after {{job.get('done',0)}} of {{job.total}} chunks{% endif %}.</p>
+<p><a href="/">Convert another</a></p>
 {% elif job.status=='done' %}
 <p><b>Ready.</b> {{job.words}} words, {{job.total}} chunks, synthesized in {{job.secs}}s.</p>
 <audio id=pj controls preload=metadata src="/job/{{id}}/audio"></audio>
@@ -697,7 +753,8 @@ def convert():
     title = (m.group(1).strip() if m else "Untitled document")
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"status": "queued", "title": title, "owner": owner,
-                    "created": time.time(), "done": 0, "total": None, "md": md}
+                    "created": time.time(), "done": 0, "total": None, "md": md,
+                    "notify": bool(request.form.get("notify"))}
     log(owner, title, "queued", f"{len(md.split())}w voice={voice}")
     threading.Thread(target=run_job, args=(job_id, md, voice, title, owner), daemon=True).start()
     return redirect(url_for("job_page", job_id=job_id))
@@ -736,22 +793,17 @@ def job_save(job_id):
     job = owned_job(job_id)
     if job.get("status") != "done" or not os.path.isfile(job.get("file", "")):
         abort(404)
-    if not job.get("saved"):
-        slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "narration"
-        lib = user_lib(current_user())
-        name = slug + ".mp3"
-        if os.path.exists(os.path.join(lib, name)):
-            name = f"{slug}-{job_id[:6]}.mp3"
-        shutil.copy2(job["file"], os.path.join(lib, name))
-        # Keep the source text beside the audio under the same basename, so a
-        # saved narration stays traceable to exactly what was read.
-        src = job.get("md", "")
-        if src:
-            with open(os.path.join(lib, name[:-4] + ".md"), "w", encoding="utf-8") as f:
-                f.write(src)
-        job["saved"] = name
-        log(current_user(), job["title"], "saved", name)
+    save_to_library(job, job["owner"], job_id)
     return redirect(url_for("library"))
+
+
+@app.route("/job/<job_id>/stop", methods=["POST"])
+def job_stop(job_id):
+    job = owned_job(job_id)
+    if job.get("status") in ("queued", "running"):
+        job["cancel"] = True   # run_job checks this between chunks
+        log(job["owner"], job["title"], "stop-requested", "")
+    return redirect(url_for("job_page", job_id=job_id))
 
 
 def _load_shares():
