@@ -562,6 +562,14 @@ setTimeout(poll,4000);})();
 
 LIB = """<h1><a href="/">lector</a></h1>
 <p class=sub>Library &middot; {{user}}'s saved narrations</p>
+{% if active %}
+<h2 style="font-size:1.05rem;margin:1.1rem 0 .3rem">In progress</h2>
+{% for a in active %}<div data-job="{{a.id}}" style="margin:.6rem 0">
+<a href="/job/{{a.id}}">{{a.title}}</a> <span class=muted>&middot; <span class=apct>{{a.done}} / {{a.total or '?'}}</span> chunks{% if a.status=='queued' %} &middot; queued{% endif %}</span>
+<div class=bar><i class=abar style="width:{{a.pct}}%"></i></div>
+</div>{% endfor %}
+<hr style="border:0;border-top:1px solid #e3e3e3;margin:1.3rem 0">
+{% endif %}
 {% if items %}{% for it in items %}
 <div style="margin:1.3rem 0">
 <b>{{it.title}}</b> <span class=muted>&middot; {{it.size}}</span><br>
@@ -580,8 +588,18 @@ LIB = """<h1><a href="/">lector</a></h1>
 </form>
 {% endif %}
 </div>
-{% endfor %}{% else %}<p class=muted>Nothing saved yet. Convert a document, then press "Save to Library" on the result.</p>{% endif %}
-<p><a href="/">Back</a></p>"""
+{% endfor %}{% elif not active %}<p class=muted>Nothing saved yet. Convert a document, then press "Save to Library" on the result.</p>{% endif %}
+<p><a href="/">Back</a></p>
+<script>
+(function(){var rows=document.querySelectorAll('[data-job]');if(!rows.length)return;
+function tick(){rows.forEach(function(row){var id=row.getAttribute('data-job');
+ fetch('/job/'+id+'/status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+  if(d.status!=='running'&&d.status!=='queued'){location.reload();return;}
+  row.querySelector('.apct').textContent=d.done+' / '+(d.total||'?');
+  row.querySelector('.abar').style.width=d.pct+'%';
+ }).catch(function(){});});setTimeout(tick,5000);}
+setTimeout(tick,5000);})();
+</script>"""
 
 SHARE_VIEW = """<h1>{{heading}}</h1>
 <p class=sub>Shared with you via lector &middot; narrated audio</p>
@@ -963,7 +981,18 @@ def library():
                           "text": text, "text_name": (n[:-4] + ".md") if text is not None else None,
                           "share_url": (BASE_URL + "/share/" + sh["token"]) if sh else None,
                           "share_text": sh["text"] if sh else False})
-    return render(LIB, "lector - library", items=items)
+    # In-progress orations: this user's jobs still being synthesized.
+    active = []
+    for jid, j in JOBS.items():
+        if j.get("owner") == current_user() and j.get("status") in ("queued", "running"):
+            total = j.get("total") or 0
+            done = j.get("done", 0)
+            active.append({"id": jid, "title": j.get("title", "Untitled"),
+                           "status": j.get("status"), "done": done, "total": j.get("total"),
+                           "pct": int(100 * done / total) if total else 0,
+                           "created": j.get("created", 0)})
+    active.sort(key=lambda a: a["created"], reverse=True)
+    return render(LIB, "lector - library", items=items, active=active)
 
 
 @app.route("/library/<name>")
