@@ -522,12 +522,30 @@ HOME = """<h1><a href="/">lector</a></h1>
 JOB = """<h1><a href="/">lector</a></h1>
 <p class=sub>{{job.title}}</p>
 {% if job.status in ['queued','running'] %}
-<p><b>Synthesizing...</b> {{job.get('done',0)}} / {{job.get('total','?')}} chunks
+<p><b>Synthesizing...</b> <span id=prog>{{job.get('done',0)}} / {{job.get('total','?')}}</span> chunks
 {% if job.get('words') %}({{job.words}} words){% endif %}</p>
-<div class=bar><i style="width:{{pct}}%"></i></div>
+<div class=bar><i id=bar style="width:{{pct}}%"></i></div>
 <p class=muted>This runs on the server. {% if job.get('notify') %}You can close this page - we'll email {{user}} a link when it's ready.{% else %}It keeps running if you close this page; reopen this URL to check on it.{% endif %}</p>
+<div id=preview style="display:none;margin-top:1.1rem">
+<p class=muted style="margin:0 0 .2rem">Preview of what's been synthesized so far:</p>
+<audio id=pv controls preload=none></audio>
+<div class=skiprow><button type=button onclick="loadpv()">Load latest</button><button type=button onclick="lskip('pv',-15)">&laquo; 15s</button><button type=button onclick="lskip('pv',15)">15s &raquo;</button></div>
+</div>
 {% if job.get('cancel') %}<p class=muted>Stopping after the current chunk...</p>
 {% else %}<form method=post action="/job/{{id}}/stop"><input type=hidden name=_csrf value="{{csrf}}"><button class=linkbtn type=submit>Stop synthesis</button></form>{% endif %}
+<script>
+var JID="{{id}}";
+function loadpv(){var a=document.getElementById('pv');var t=a.currentTime||0;a.src="/job/"+JID+"/audio?n="+Date.now();a.load();a.addEventListener('loadedmetadata',function h(){try{a.currentTime=t;}catch(e){}a.removeEventListener('loadedmetadata',h);});}
+(function(){var primed=false;
+function poll(){fetch("/job/"+JID+"/status",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+ if(d.status!=="running"&&d.status!=="queued"){location.reload();return;}
+ document.getElementById('prog').textContent=d.done+" / "+(d.total||"?");
+ document.getElementById('bar').style.width=d.pct+"%";
+ if(d.done>0){document.getElementById('preview').style.display="block";if(!primed){primed=true;loadpv();}}
+ setTimeout(poll,4000);
+}).catch(function(){setTimeout(poll,6000);});}
+setTimeout(poll,4000);})();
+</script>
 {% elif job.status=='stopped' %}
 <p><b>Stopped.</b> You stopped this synthesis{% if job.get('total') %} after {{job.get('done',0)}} of {{job.total}} chunks{% endif %}.</p>
 <p><a href="/">Convert another</a></p>
@@ -855,20 +873,31 @@ def job_page(job_id):
     job = owned_job(job_id)
     pct = int(100 * job.get("done", 0) / (job.get("total") or 1)) if job["status"] == "running" else (100 if job["status"] == "done" else 0)
     slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "lector"
-    resp = Response(render(JOB, "lector - " + job["title"][:40], job=job, id=job_id, pct=pct, slug=slug))
-    if job["status"] in ("queued", "running"):
-        resp.headers["Refresh"] = "4"
-    return resp
+    # A running job updates via JS polling (see JOB template) rather than a full
+    # page refresh, so previewing the partial audio is not interrupted.
+    return render(JOB, "lector - " + job["title"][:40], job=job, id=job_id, pct=pct, slug=slug)
 
 
 @app.route("/job/<job_id>/audio")
 def job_audio(job_id):
     job = owned_job(job_id)
-    if job.get("status") != "done":
+    path = os.path.join(JOBS_DIR, job_id + ".mp3")
+    # Serve the partial while running (preview) as well as the finished file.
+    if job.get("status") not in ("running", "done") or not os.path.isfile(path):
         abort(404)
     slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "lector"
-    return send_file(job["file"], mimetype="audio/mpeg", download_name=slug + ".mp3",
+    return send_file(path, mimetype="audio/mpeg", download_name=slug + ".mp3",
                      conditional=not app.config["USE_X_SENDFILE"])
+
+
+@app.route("/job/<job_id>/status")
+def job_status(job_id):
+    job = owned_job(job_id)
+    total = job.get("total") or 0
+    done = job.get("done", 0)
+    pct = int(100 * done / total) if total else (100 if job.get("status") == "done" else 0)
+    return {"status": job.get("status"), "done": done, "total": job.get("total"),
+            "words": job.get("words"), "pct": pct}
 
 
 @app.route("/job/<job_id>/save", methods=["POST"])
