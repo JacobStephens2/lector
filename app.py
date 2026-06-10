@@ -375,9 +375,27 @@ def save_to_library(job, owner, job_id):
     if src:
         with open(os.path.join(lib, name[:-4] + ".md"), "w", encoding="utf-8") as f:
             f.write(src)
+    # Keep the exact display name beside the audio so the Library shows it verbatim
+    # (the filename is a lossy lowercased slug).
+    with open(os.path.join(lib, name[:-4] + ".title"), "w", encoding="utf-8") as f:
+        f.write(job.get("title", ""))
     job["saved"] = name
     log(owner, job["title"], "saved", name)
     return name
+
+
+def lib_title(lib_dir, name):
+    """Display title for a library item: the saved .title sidecar if present,
+    otherwise derived from the filename (for entries saved before titles existed)."""
+    tp = os.path.join(lib_dir, name[:-4] + ".title")
+    if os.path.isfile(tp):
+        try:
+            t = open(tp, encoding="utf-8").read().strip()
+            if t:
+                return t
+        except OSError:
+            pass
+    return re.sub(r"[-_]+", " ", name[:-4]).strip().capitalize()
 
 
 def run_job(job_id, md, voice, title, owner, resume=False):
@@ -519,6 +537,8 @@ HOME = """<h1><a href="/">lector</a></h1>
 <p class=sub>Paste a markdown document. Get an MP3 you can listen to. &middot; <a href="/library">Library</a></p>
 <form method=post action="/convert" enctype=multipart/form-data>
 <input type=hidden name=_csrf value="{{csrf}}">
+<label for=title>Name (optional)</label>
+<input id=title name=title type=text maxlength=120 placeholder="Name this oration; defaults to the document's heading" style="width:100%;box-sizing:border-box">
 <label for=md>Markdown</label>
 <textarea id=md name=md placeholder="# Paste markdown here, or choose a .md file below"></textarea>
 <div class=row>
@@ -876,8 +896,10 @@ def convert():
     if voice not in voices_for(owner):   # enforce: unauthorized accounts can't pick OpenAI voices
         voice = default_voice_for(owner)
     remember_voice(owner, voice)         # preselect this voice next time
-    m = re.search(r"^#\s+(.+)$", md, re.M) or re.search(r"^(.{3,80})$", md, re.M)
-    title = (m.group(1).strip() if m else "Untitled document")
+    title = (request.form.get("title") or "").strip()[:120]
+    if not title:
+        m = re.search(r"^#\s+(.+)$", md, re.M) or re.search(r"^(.{3,80})$", md, re.M)
+        title = (m.group(1).strip() if m else "Untitled document")
     job_id = uuid.uuid4().hex
     limit = KOKORO_CHUNK_LIMIT if backend_of_voice(voice) == "kokoro" else CHUNK_LIMIT
     JOBS[job_id] = {"status": "queued", "title": title, "owner": owner, "voice": voice,
@@ -983,7 +1005,7 @@ def library():
     for n in sorted(os.listdir(lib)):
         if n.endswith(".mp3"):
             mb = os.path.getsize(os.path.join(lib, n)) / 1048576
-            title = re.sub(r"[-_]+", " ", n[:-4]).strip().capitalize()
+            title = lib_title(lib, n)
             text = None
             tp = os.path.join(lib, n[:-4] + ".md")
             if os.path.isfile(tp):
@@ -1077,7 +1099,7 @@ def share(token):
     if not s:
         abort(404)
     name = s["name"]
-    title = re.sub(r"[-_]+", " ", name[:-4]).strip().capitalize()
+    title = lib_title(user_lib(s["owner"]), name)
     text = None
     if s.get("text"):
         tp = os.path.join(user_lib(s["owner"]), name[:-4] + ".md")
