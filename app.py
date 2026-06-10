@@ -341,6 +341,21 @@ def tts(text, voice):
     return tts_openai(text, voice) if backend_of_voice(voice) == "openai" else tts_kokoro(text, voice)
 
 
+def fmt_duration(secs):
+    """Human-readable duration: seconds when brief, minutes/hours when longer."""
+    secs = int(secs or 0)
+    if secs < 90:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m} min" if s < 5 else f"{m} min {s}s"
+    h, m = divmod(m, 60)
+    return f"{h} h {m} min" if m else f"{h} h"
+
+
+app.jinja_env.globals["fmt_duration"] = fmt_duration
+
+
 def _h(s):
     """Minimal HTML escape for values interpolated into emails."""
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -425,7 +440,7 @@ def run_job(job_id, md, voice, title, owner, resume=False):
             link = f"{BASE_URL}/library/{saved}" if saved else f"{BASE_URL}/job/{job_id}"
             send_email(owner, f'lector: "{title}" is ready',
                        f"<p>Your narration <b>{_h(title)}</b> is ready "
-                       f"({job['words']} words, synthesized in {job['secs']}s).</p>"
+                       f"({job['words']} words, synthesized in {fmt_duration(job['secs'])}).</p>"
                        f'<p><a href="{link}">Listen in your Library</a>.</p>')
     except Exception as e:
         job.update(status="error", error=str(e))
@@ -550,7 +565,7 @@ setTimeout(poll,4000);})();
 <p><b>Stopped.</b> You stopped this synthesis{% if job.get('total') %} after {{job.get('done',0)}} of {{job.total}} chunks{% endif %}.</p>
 <p><a href="/">Convert another</a></p>
 {% elif job.status=='done' %}
-<p><b>Ready.</b> {{job.words}} words, {{job.total}} chunks, synthesized in {{job.secs}}s.</p>
+<p><b>Ready.</b> {{job.words}} words, {{job.total}} chunks, synthesized in {{ fmt_duration(job.secs) }}.</p>
 <audio id=pj controls preload=metadata src="/job/{{id}}/audio"></audio>
 <div class=skiprow><button type=button onclick="lskip('pj',-15)">&laquo; 15s</button><button type=button onclick="lskip('pj',15)">15s &raquo;</button></div>
 <p><a href="/job/{{id}}/audio" download="{{slug}}.mp3">Download MP3</a> &middot; <a href="/">Convert another</a></p>
