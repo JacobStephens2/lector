@@ -379,6 +379,10 @@ def save_to_library(job, owner, job_id):
     # (the filename is a lossy lowercased slug).
     with open(os.path.join(lib, name[:-4] + ".title"), "w", encoding="utf-8") as f:
         f.write(job.get("title", ""))
+    # And how it was made, for the entry's detail page.
+    with open(os.path.join(lib, name[:-4] + ".meta"), "w") as f:
+        json.dump({"secs": job.get("secs"), "words": job.get("words"),
+                   "voice": job.get("voice")}, f)
     job["saved"] = name
     log(owner, job["title"], "saved", name)
     return name
@@ -583,6 +587,12 @@ HOME = """<h1><a href="/">lector</a></h1>
 
 JOB = """<h1><a href="/">lector</a></h1>
 <p class=sub>{{job.title}}</p>
+{% if job.status in ['queued','running','done'] %}<details style="margin:0 0 .8rem"><summary class=muted style="cursor:pointer">Rename</summary>
+<form method=post action="/job/{{id}}/rename" style="margin-top:.4rem">
+<input type=hidden name=_csrf value="{{csrf}}">
+<input name=title type=text maxlength=120 value="{{job.title}}" style="width:65%;box-sizing:border-box">
+<button class=linkbtn type=submit style="margin-left:.5rem">Save name</button>
+</form></details>{% endif %}
 {% if job.status in ['queued','running'] %}
 <p><b>Synthesizing...</b> <span id=prog>{{job.get('done',0)}} / {{job.get('total','?')}}</span> chunks
 {% if job.get('words') %}({{job.words}} words){% endif %}</p>
@@ -640,7 +650,7 @@ LIB = """<h1><a href="/">lector</a></h1>
 {% endif %}
 {% if items %}{% for it in items %}
 <div id="{{it.name}}" style="margin:1.3rem 0;scroll-margin-top:1rem">
-<b>{{it.title}}</b> <span class=muted>{% if it.length %}&middot; {{it.length}} {% endif %}&middot; {{it.size}}</span><br>
+<b><a href="/library/{{it.name}}/view" style="text-decoration:none">{{it.title}}</a></b> <span class=muted>{% if it.length %}&middot; {{it.length}} {% endif %}&middot; {{it.size}}</span><br>
 <audio id="lb{{loop.index}}" controls preload=none src="/library/{{it.name}}"></audio>
 <div class=skiprow><button type=button onclick="lskip('lb{{loop.index}}',-15)">&laquo; 15s</button><button type=button onclick="lskip('lb{{loop.index}}',15)">15s &raquo;</button></div>
 <a href="/library/{{it.name}}" download>Download audio</a>{% if it.text is not none %} &middot; <a href="/library/{{it.text_name}}" download>Download text</a>
@@ -674,6 +684,32 @@ function tick(){rows.forEach(function(row){var id=row.getAttribute('data-job');
  }).catch(function(){});});setTimeout(tick,5000);}
 setTimeout(tick,5000);})();
 </script>"""
+
+ENTRY = """<h1><a href="/">lector</a></h1>
+<p class=sub><a href="/library">Library</a> &middot; saved narration</p>
+<h2 style="font-size:1.25rem;margin:.2rem 0 .1rem">{{heading}}</h2>
+<p class=muted style="margin:.1rem 0 .6rem">{% if length %}{{length}} &middot; {% endif %}{{size}}{% if secs %} &middot; synthesized in {{ fmt_duration(secs) }}{% endif %}{% if words %} &middot; {{words}} words{% endif %}</p>
+<audio id=de controls preload=metadata src="/library/{{name}}"></audio>
+<div class=skiprow><button type=button onclick="lskip('de',-15)">&laquo; 15s</button><button type=button onclick="lskip('de',15)">15s &raquo;</button></div>
+<p><a href="/library/{{name}}" download>Download audio</a>{% if text is not none %} &middot; <a href="/library/{{text_name}}" download>Download text</a>{% endif %}</p>
+<label for=rt>Name</label>
+<form method=post action="/library/{{name}}/rename">
+<input type=hidden name=_csrf value="{{csrf}}"><input type=hidden name=back value=view>
+<input id=rt name=title type=text maxlength=120 value="{{heading}}" style="width:65%;box-sizing:border-box">
+<button class=linkbtn type=submit style="margin-left:.5rem">Save name</button>
+</form>
+{% if share_url %}
+<div class=muted style="margin-top:1rem">Shared{% if share_text %} with source text{% endif %} &middot; <form method=post action="/library/{{name}}/unshare" style="display:inline;margin:0"><input type=hidden name=_csrf value="{{csrf}}"><input type=hidden name=back value=view><button class=linkbtn type=submit>stop sharing</button></form></div>
+<input class=shareurl readonly onclick="this.select()" value="{{share_url}}">
+{% else %}
+<form method=post action="/library/{{name}}/share" style="margin-top:1rem">
+<input type=hidden name=_csrf value="{{csrf}}"><input type=hidden name=back value=view>
+{% if text is not none %}<label style="font-weight:400;display:inline;margin:0"><input type=checkbox name=text value=1 checked style="width:auto"> include source text</label> &middot; {% endif %}<button class=linkbtn type=submit>create share link</button>
+</form>
+{% endif %}
+{% if text is not none %}<details style="margin-top:1rem"><summary class=muted style="cursor:pointer">Source text</summary>
+<pre class=src>{{text}}</pre></details>{% endif %}
+<p style="margin-top:1.4rem"><a href="/library">Back to Library</a></p>"""
 
 SHARE_VIEW = """<h1>{{heading}}</h1>
 <p class=sub>Shared with you via lector &middot; narrated audio</p>
@@ -1004,6 +1040,21 @@ def job_save(job_id):
     return redirect(url_for("library"))
 
 
+@app.route("/job/<job_id>/rename", methods=["POST"])
+def job_rename(job_id):
+    job = owned_job(job_id)
+    new = (request.form.get("title") or "").strip()[:120]
+    if new and new != job.get("title"):
+        job["title"] = new
+        persist_job(job_id)
+        if job.get("saved"):   # already in the library -> keep its display name in step
+            with open(os.path.join(user_lib(job["owner"]), job["saved"][:-4] + ".title"),
+                      "w", encoding="utf-8") as f:
+                f.write(new)
+        log(job["owner"], new, "rename", job_id[:8])
+    return redirect(url_for("job_page", job_id=job_id))
+
+
 @app.route("/job/<job_id>/stop", methods=["POST"])
 def job_stop(job_id):
     job = owned_job(job_id)
@@ -1102,7 +1153,41 @@ def library_rename(name):
         except OSError:
             pass
     log(current_user(), new or name, "rename", name)
+    if request.form.get("back") == "view":
+        return redirect(url_for("library_entry", name=name))
     return redirect(url_for("library") + "#" + name)
+
+
+@app.route("/library/<name>/view")
+def library_entry(name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.mp3", name):
+        abort(404)
+    lib = user_lib(current_user())
+    path = os.path.join(lib, name)
+    if not os.path.isfile(path):
+        abort(404)
+    dur = mp3_duration(path)
+    meta = {}
+    try:
+        meta = json.load(open(path[:-4] + ".meta"))
+    except Exception:
+        pass
+    text = None
+    tp = path[:-4] + ".md"
+    if os.path.isfile(tp):
+        try:
+            text = open(tp, encoding="utf-8", errors="replace").read()
+        except Exception:
+            text = None
+    sh = _user_shares(current_user()).get(name)
+    title = lib_title(lib, name)
+    return render(ENTRY, "lector - " + title[:40], name=name, heading=title,
+                  size=f"{os.path.getsize(path) / 1048576:.1f} MB",
+                  length=fmt_duration(dur) if dur else None,
+                  secs=meta.get("secs"), words=meta.get("words"),
+                  text=text, text_name=name[:-4] + ".md",
+                  share_url=(BASE_URL + "/share/" + sh["token"]) if sh else None,
+                  share_text=sh["text"] if sh else False)
 
 
 # ------------------------------------------------------------------ share links
@@ -1127,6 +1212,8 @@ def library_share(name):
                        "created": datetime.datetime.now().isoformat(timespec="seconds")}
         _save_shares(shares)
     log(current_user(), name, "share-create", "with-text" if want_text else "audio-only")
+    if request.form.get("back") == "view":
+        return redirect(url_for("library_entry", name=name))
     return redirect(url_for("library"))
 
 
@@ -1142,6 +1229,8 @@ def library_unshare(name):
             _save_shares(shares)
     if gone:
         log(current_user(), name, "share-revoke", "")
+    if request.form.get("back") == "view":
+        return redirect(url_for("library_entry", name=name))
     return redirect(url_for("library"))
 
 
