@@ -561,8 +561,8 @@ JOB = """<h1><a href="/">lector</a></h1>
 {% if job.get('words') %}({{job.words}} words){% endif %}</p>
 <div class=bar><i id=bar style="width:{{pct}}%"></i></div>
 <p class=muted>This runs on the server. {% if job.get('notify') %}You can close this page - we'll email {{user}} a link when it's ready.{% else %}It keeps running if you close this page; reopen this URL to check on it.{% endif %}</p>
-<div id=preview style="display:none;margin-top:1.1rem">
-<p class=muted style="margin:0 0 .2rem">Preview of what's been synthesized so far:</p>
+<div id=preview style="display:{% if job.get('done',0) %}block{% else %}none{% endif %};margin-top:1.1rem">
+<p class=muted style="margin:0 0 .2rem"><span id=pvmsg>Loading a preview of the audio synthesized so far...</span></p>
 <audio id=pv controls preload=none></audio>
 <div class=skiprow><button type=button onclick="loadpv()">Load latest</button><button type=button onclick="lskip('pv',-15)">&laquo; 15s</button><button type=button onclick="lskip('pv',15)">15s &raquo;</button></div>
 </div>
@@ -570,13 +570,19 @@ JOB = """<h1><a href="/">lector</a></h1>
 {% else %}<form method=post action="/job/{{id}}/stop"><input type=hidden name=_csrf value="{{csrf}}"><button class=linkbtn type=submit>Stop synthesis</button></form>{% endif %}
 <script>
 var JID="{{id}}";
-function loadpv(){var a=document.getElementById('pv');var t=a.currentTime||0;a.src="/job/"+JID+"/audio?n="+Date.now();a.load();a.addEventListener('loadedmetadata',function h(){try{a.currentTime=t;}catch(e){}a.removeEventListener('loadedmetadata',h);});}
-(function(){var primed=false;
+function pvmsg(t){var m=document.getElementById('pvmsg');if(m)m.textContent=t;}
+function loadpv(){var a=document.getElementById('pv');var t=a.currentTime||0;
+ pvmsg("Loading a preview of the audio synthesized so far...");
+ a.src="/job/"+JID+"/audio?n="+Date.now();a.load();
+ a.addEventListener('loadedmetadata',function h(){try{a.currentTime=t;}catch(e){}pvmsg("Preview of the audio synthesized so far:");a.removeEventListener('loadedmetadata',h);});
+ a.addEventListener('error',function h(){pvmsg("Preview will be ready shortly...");a.removeEventListener('error',h);});}
+(function(){var pv=document.getElementById('preview');var primed=false;
+if(pv&&pv.style.display!=="none"){primed=true;loadpv();}   // a preview already exists at load -> show it now
 function poll(){fetch("/job/"+JID+"/status",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
  if(d.status!=="running"&&d.status!=="queued"){location.reload();return;}
  document.getElementById('prog').textContent=d.done+" / "+(d.total||"?");
  document.getElementById('bar').style.width=d.pct+"%";
- if(d.done>0){document.getElementById('preview').style.display="block";if(!primed){primed=true;loadpv();}}
+ if(d.done>0){pv.style.display="block";if(!primed){primed=true;loadpv();}}
  setTimeout(poll,4000);
 }).catch(function(){setTimeout(poll,6000);});}
 setTimeout(poll,4000);})();
