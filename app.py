@@ -437,7 +437,7 @@ def run_job(job_id, md, voice, title, owner, resume=False):
         if job.get("notify"):
             saved = save_to_library(job, owner, job_id)   # durable target for the email link
             persist_job(job_id)
-            link = f"{BASE_URL}/library/{saved}" if saved else f"{BASE_URL}/job/{job_id}"
+            link = f"{BASE_URL}/library#{saved}" if saved else f"{BASE_URL}/job/{job_id}"
             send_email(owner, f'lector: "{title}" is ready',
                        f"<p>Your narration <b>{_h(title)}</b> is ready "
                        f"({job['words']} words, synthesized in {fmt_duration(job['secs'])}).</p>"
@@ -569,7 +569,7 @@ setTimeout(poll,4000);})();
 <audio id=pj controls preload=metadata src="/job/{{id}}/audio"></audio>
 <div class=skiprow><button type=button onclick="lskip('pj',-15)">&laquo; 15s</button><button type=button onclick="lskip('pj',15)">15s &raquo;</button></div>
 <p><a href="/job/{{id}}/audio" download="{{slug}}.mp3">Download MP3</a> &middot; <a href="/">Convert another</a></p>
-{% if job.get('saved') %}<p class=muted>Saved to <a href="/library/{{job.saved}}">Library</a> as {{job.saved}}.</p>
+{% if job.get('saved') %}<p class=muted>Saved to <a href="/library#{{job.saved}}">Library</a> as {{job.saved}}.</p>
 {% else %}<form method=post action="/job/{{id}}/save"><input type=hidden name=_csrf value="{{csrf}}"><button type=submit>Save to Library</button></form>{% endif %}
 {% else %}
 <p><b>Error.</b> {{job.get('error','unknown')}}</p><p><a href="/">Try again</a></p>
@@ -586,7 +586,7 @@ LIB = """<h1><a href="/">lector</a></h1>
 <hr style="border:0;border-top:1px solid #e3e3e3;margin:1.3rem 0">
 {% endif %}
 {% if items %}{% for it in items %}
-<div style="margin:1.3rem 0">
+<div id="{{it.name}}" style="margin:1.3rem 0;scroll-margin-top:1rem">
 <b>{{it.title}}</b> <span class=muted>&middot; {{it.size}}</span><br>
 <audio id="lb{{loop.index}}" controls preload=none src="/library/{{it.name}}"></audio>
 <div class=skiprow><button type=button onclick="lskip('lb{{loop.index}}',-15)">&laquo; 15s</button><button type=button onclick="lskip('lb{{loop.index}}',15)">15s &raquo;</button></div>
