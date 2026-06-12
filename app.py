@@ -6,11 +6,11 @@ Boundaries (see /about): the OpenAI key lives only in this process's environment
 credentials and signed sessions; every job and account action is logged; the app
 produces audio and nothing else - it never sends, publishes, or posts.
 """
-import os, re, io, json, time, uuid, shutil, secrets, smtplib, threading, datetime
+import functools, hashlib, os, re, io, json, time, uuid, shutil, secrets, smtplib, threading, datetime
 import urllib.request, urllib.error
 from email.message import EmailMessage
 from flask import (Flask, request, redirect, url_for, send_file, abort, Response,
-                   render_template_string, session)
+                   render_template_string, session, jsonify, g)
 from werkzeug.security import generate_password_hash, check_password_hash
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +61,7 @@ SMTP_PASS = os.environ.get("SMTP_PASS")
 SMTP_FROM = os.environ.get("SMTP_FROM", "you@example.com")
 
 app = Flask(__name__)
-app.config.update(MAX_CONTENT_LENGTH=MAX_INPUT + 64 * 1024,
+app.config.update(MAX_CONTENT_LENGTH=512 * 1024 * 1024,   # API uploads; convert() self-caps text at MAX_INPUT
                   SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=True,
                   SESSION_COOKIE_SAMESITE="Lax",
                   PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=30),
@@ -404,6 +404,27 @@ def lib_title(lib_dir, name):
         except OSError:
             pass
     return re.sub(r"[-_]+", " ", name[:-4]).strip().capitalize()
+
+
+AUDIO_EXT_RE = r"\.(mp3|m4a|aac)"
+
+
+def audio_mime(name):
+    return {"mp3": "audio/mpeg", "m4a": "audio/mp4", "aac": "audio/aac"}[name.rsplit(".", 1)[1]]
+
+
+def strip_ext(name):
+    return re.sub(AUDIO_EXT_RE + "$", "", name)
+
+
+def audio_duration(path):
+    """Duration in seconds: frame-parsed for mp3; uploaded formats carry it in .meta."""
+    if path.endswith(".mp3"):
+        return mp3_duration(path)
+    try:
+        return json.load(open(strip_ext(path) + ".meta")).get("duration_secs")
+    except Exception:
+        return None
 
 
 def mp3_duration(path):
@@ -775,7 +796,13 @@ ACCOUNT = """<h1><a href="/">sotto</a></h1><p class=sub>Account &middot; {{user}
 <label for=c>Current password</label><input id=c name=current type=password autocomplete=current-password>
 <label for=n>New password</label><input id=n name=new type=password autocomplete=new-password>
 <button type=submit>Change password</button>
-</form>"""
+</form>
+<h2 style="font-size:1.1rem;margin-top:1.8rem">App access tokens</h2>
+<p class=muted>Issued by the Sotto Android app when you connect this account. Revoking one signs that device out.</p>
+{% if tokens %}<table class=u><tr><th>Label</th><th>Created</th><th>Last used</th><th></th></tr>
+{% for t in tokens %}<tr><td>{{t.label or "(unlabeled)"}}</td><td>{{t.created}}</td><td>{{t.last_used}}</td>
+<td><form method=post action="/account/tokens/revoke" style="margin:0"><input type=hidden name=_csrf value="{{csrf}}"><input type=hidden name=hash value="{{t.hash}}"><button class=linkbtn type=submit>revoke</button></form></td></tr>{% endfor %}
+</table>{% else %}<p class=muted>No tokens.</p>{% endif %}"""
 
 ADMIN = """<h1><a href="/">sotto</a></h1><p class=sub>Admin &middot; accounts</p>
 {% if msg %}<p style="color:#197">{{msg}}</p>{% endif %}{% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
@@ -824,7 +851,9 @@ def render(body_tpl, title, **ctx):
 
 # --------------------------------------------------------------------------- gate
 PUBLIC = {"login", "healthz", "static", "forgot", "reset",
-          "share", "share_audio", "share_text", "favicon"}
+          "share", "share_audio", "share_text", "favicon",
+          "api_token", "api_me", "api_library", "api_audio", "api_text",
+          "api_put", "api_patch", "api_delete"}
 
 
 @app.before_request
@@ -834,6 +863,8 @@ def gate():
     if request.endpoint not in PUBLIC and not current_user():
         nxt = request.full_path if request.method == "GET" else None
         return redirect(url_for("login", next=nxt) if nxt else url_for("login"))
+    if request.endpoint and request.endpoint.startswith("api_"):
+        return   # token-authenticated JSON API: no session, no CSRF
     if request.method == "POST" and request.endpoint != "static":
         if not request.form.get("_csrf") or request.form.get("_csrf") != session.get("csrf"):
             abort(400)
@@ -929,7 +960,22 @@ def account():
                 save_users(users)
             log(current_user(), "-", "password-change", "")
             msg = "Password changed."
-    return render(ACCOUNT, "sotto - account", msg=msg, error=error)
+    mine = [dict(hash=h, **t) for h, t in _load_api_tokens().items() if t.get("email") == current_user()]
+    mine.sort(key=lambda t: t.get("created", ""), reverse=True)
+    return render(ACCOUNT, "sotto - account", msg=msg, error=error, tokens=mine)
+
+
+@app.route("/account/tokens/revoke", methods=["POST"])
+def account_token_revoke():
+    h = request.form.get("hash") or ""
+    with API_TOKEN_LOCK:
+        toks = _load_api_tokens()
+        entry = toks.get(h)
+        if entry and entry.get("email") == current_user():
+            toks.pop(h)
+            _save_api_tokens(toks)
+            log(current_user(), entry.get("label") or "-", "api-token-revoke", h[:8])
+    return redirect(url_for("account"))
 
 
 @app.route("/admin")
@@ -1168,9 +1214,9 @@ def library():
     shares = _user_shares(current_user())
     items = []
     for n in sorted(os.listdir(lib)):
-        if n.endswith(".mp3"):
+        if n.endswith((".mp3", ".m4a", ".aac")):
             mb = os.path.getsize(os.path.join(lib, n)) / 1048576
-            dur = mp3_duration(os.path.join(lib, n))
+            dur = audio_duration(os.path.join(lib, n))
             title = lib_title(lib, n)
             text = None
             tp = os.path.join(lib, n[:-4] + ".md")
@@ -1201,18 +1247,18 @@ def library():
 
 @app.route("/library/<name>")
 def library_file(name):
-    if not re.fullmatch(r"[A-Za-z0-9._-]+\.(mp3|md)", name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.(mp3|m4a|aac|md)", name):
         abort(404)
     path = os.path.join(user_lib(current_user()), name)
     if not os.path.isfile(path):
         abort(404)
-    mime = "audio/mpeg" if name.endswith(".mp3") else "text/markdown; charset=utf-8"
+    mime = "text/markdown; charset=utf-8" if name.endswith(".md") else audio_mime(name)
     return send_file(path, mimetype=mime, conditional=not app.config["USE_X_SENDFILE"])
 
 
 @app.route("/library/<name>/rename", methods=["POST"])
 def library_rename(name):
-    if not re.fullmatch(r"[A-Za-z0-9._-]+\.mp3", name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+" + AUDIO_EXT_RE, name):
         abort(404)
     lib = user_lib(current_user())
     if not os.path.isfile(os.path.join(lib, name)):
@@ -1227,6 +1273,7 @@ def library_rename(name):
             os.remove(tp)   # blank -> revert to the filename-derived name
         except OSError:
             pass
+    os.utime(os.path.join(lib, name), None)   # bump mtime: renames sync last-write-wins
     log(current_user(), new or name, "rename", name)
     if request.form.get("back") == "view":
         return redirect(url_for("library_entry", name=name))
@@ -1235,13 +1282,13 @@ def library_rename(name):
 
 @app.route("/library/<name>/view")
 def library_entry(name):
-    if not re.fullmatch(r"[A-Za-z0-9._-]+\.mp3", name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+" + AUDIO_EXT_RE, name):
         abort(404)
     lib = user_lib(current_user())
     path = os.path.join(lib, name)
     if not os.path.isfile(path):
         abort(404)
-    dur = mp3_duration(path)
+    dur = audio_duration(path)
     meta = {}
     try:
         meta = json.load(open(path[:-4] + ".meta"))
@@ -1271,7 +1318,7 @@ def library_entry(name):
 # revoked only by the owner, and every create/revoke writes an audit line.
 @app.route("/library/<name>/share", methods=["POST"])
 def library_share(name):
-    if not re.fullmatch(r"[A-Za-z0-9._-]+\.mp3", name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+" + AUDIO_EXT_RE, name):
         abort(404)
     lib = user_lib(current_user())
     if not os.path.isfile(os.path.join(lib, name)):
@@ -1312,7 +1359,7 @@ def library_unshare(name):
 def _shared(token):
     """Return a valid share record for a token, or None."""
     s = _load_shares().get(token)
-    if not s or not re.fullmatch(r"[A-Za-z0-9._-]+\.mp3", s.get("name", "")):
+    if not s or not re.fullmatch(r"[A-Za-z0-9._-]+" + AUDIO_EXT_RE, s.get("name", "")):
         return None
     if not os.path.isfile(os.path.join(user_lib(s["owner"]), s["name"])):
         return None
@@ -1343,7 +1390,7 @@ def share_audio(token):
     s = _shared(token)
     if not s:
         abort(404)
-    return send_file(os.path.join(user_lib(s["owner"]), s["name"]), mimetype="audio/mpeg",
+    return send_file(os.path.join(user_lib(s["owner"]), s["name"]), mimetype=audio_mime(s["name"]),
                      conditional=not app.config["USE_X_SENDFILE"])
 
 
@@ -1424,6 +1471,203 @@ its training data or the labor behind it; sotto says so rather than passing the 
 {% endif %}
 </ul>
 <p><a href="/">Back</a></p>"""
+
+
+
+
+# -------------------------------------------------------------------- API v1
+# Token-authenticated JSON API for the Sotto Android app's sync flavor
+# (contract: sotto-android docs/12-api-contract.md). Tokens are stored hashed;
+# the web account page lists and revokes them. Narration never happens here -
+# the API only moves finished orations and metadata.
+API_TOKENS_PATH = os.path.join(STATE_DIR, "api_tokens.json")
+API_TOKEN_LOCK = threading.Lock()
+_api_rate = {}
+API_NAME_RE = r"[a-z0-9-]{1,60}\.(mp3|m4a|aac)"
+
+
+def _load_api_tokens():
+    try:
+        return json.load(open(API_TOKENS_PATH))
+    except Exception:
+        return {}
+
+
+def _save_api_tokens(toks):
+    with open(API_TOKENS_PATH + ".tmp", "w") as f:
+        json.dump(toks, f, indent=1)
+    os.replace(API_TOKENS_PATH + ".tmp", API_TOKENS_PATH)
+
+
+def _api_err(status, key, detail=""):
+    return jsonify({"error": key, "detail": detail}), status
+
+
+def require_token(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return _api_err(401, "auth", "Bearer token required")
+        h = hashlib.sha256(auth[7:].encode()).hexdigest()
+        entry = _load_api_tokens().get(h)
+        if not entry:
+            return _api_err(401, "auth", "unknown or revoked token")
+        with API_TOKEN_LOCK:
+            toks = _load_api_tokens()
+            if h in toks:
+                toks[h]["last_used"] = datetime.datetime.now().isoformat(timespec="seconds")
+                _save_api_tokens(toks)
+        g.api_user = entry["email"]
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route("/api/v1/token", methods=["POST"])
+def api_token():
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "-").split(",")[0].strip()
+    now_ts = time.time()
+    _api_rate[ip] = [t for t in _api_rate.get(ip, []) if now_ts - t < 60]
+    if len(_api_rate[ip]) >= 5:
+        return _api_err(429, "rate-limited", "5 token requests per minute")
+    _api_rate[ip].append(now_ts)
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    info = load_users().get(email)
+    if not info or not check_password_hash(info["pw"], data.get("password") or ""):
+        log(email or "-", "-", "api-token-fail", ip)
+        return _api_err(401, "auth", "incorrect email or password")
+    tok = secrets.token_urlsafe(32)
+    created = datetime.datetime.now().isoformat(timespec="seconds")
+    with API_TOKEN_LOCK:
+        toks = _load_api_tokens()
+        toks[hashlib.sha256(tok.encode()).hexdigest()] = {
+            "email": email, "created": created, "last_used": created,
+            "label": str(data.get("label") or "")[:40]}
+        _save_api_tokens(toks)
+    log(email, "-", "api-token-create", data.get("label") or "")
+    return jsonify({"token": tok, "created": created}), 201
+
+
+@app.route("/api/v1/me")
+@require_token
+def api_me():
+    return jsonify({"email": g.api_user})
+
+
+@app.route("/api/v1/library")
+@require_token
+def api_library():
+    lib = user_lib(g.api_user)
+    entries = []
+    for n in sorted(os.listdir(lib)):
+        if not n.endswith((".mp3", ".m4a", ".aac")):
+            continue
+        p = os.path.join(lib, n)
+        meta = {}
+        try:
+            meta = json.load(open(p[:-4] + ".meta"))
+        except Exception:
+            pass
+        entries.append({
+            "name": n, "title": lib_title(lib, n),
+            "words": meta.get("words"), "secs": meta.get("secs"),
+            "voice": meta.get("voice"), "size": os.path.getsize(p),
+            "duration_secs": audio_duration(p), "mtime": int(os.path.getmtime(p)),
+            "has_text": os.path.isfile(p[:-4] + ".md")})
+    return jsonify({"entries": entries})
+
+
+def _api_entry_path(name):
+    if not re.fullmatch(API_NAME_RE, name):
+        abort(404)
+    path = os.path.join(user_lib(g.api_user), name)
+    if not os.path.isfile(path):
+        abort(404)
+    return path
+
+
+@app.route("/api/v1/library/<name>/audio")
+@require_token
+def api_audio(name):
+    return send_file(_api_entry_path(name), mimetype=audio_mime(name),
+                     conditional=not app.config["USE_X_SENDFILE"])
+
+
+@app.route("/api/v1/library/<name>/text")
+@require_token
+def api_text(name):
+    tp = _api_entry_path(name)[:-4] + ".md"
+    if not os.path.isfile(tp):
+        abort(404)
+    return send_file(tp, mimetype="text/markdown; charset=utf-8",
+                     conditional=not app.config["USE_X_SENDFILE"])
+
+
+@app.route("/api/v1/library/<name>", methods=["PUT"])
+@require_token
+def api_put(name):
+    if not re.fullmatch(API_NAME_RE, name):
+        return _api_err(400, "validation", "name must match " + API_NAME_RE)
+    audio = request.files.get("audio")
+    if audio is None:
+        return _api_err(400, "validation", "multipart part 'audio' required")
+    lib = user_lib(g.api_user)
+    path = os.path.join(lib, name)
+    existed = os.path.exists(path)
+    if existed and request.headers.get("If-None-Match") == "*":
+        return _api_err(409, "conflict", "entry exists")
+    audio.save(path + ".tmp")
+    os.replace(path + ".tmp", path)
+    text = request.files.get("text")
+    if text is not None:
+        text.save(path[:-4] + ".md")
+    try:
+        meta = json.loads(request.form.get("meta") or "{}")
+    except ValueError:
+        meta = {}
+    with open(path[:-4] + ".meta", "w") as f:
+        json.dump({k: meta.get(k) for k in ("secs", "words", "voice", "duration_secs")}, f)
+    with open(path[:-4] + ".title", "w", encoding="utf-8") as f:
+        f.write(str(meta.get("title") or "")[:120] or strip_ext(name))
+    log(g.api_user, meta.get("title") or name, "api-upload",
+        f"{name} {os.path.getsize(path)}B {'replaced' if existed else 'created'}")
+    return jsonify({"name": name}), 200 if existed else 201
+
+
+@app.route("/api/v1/library/<name>", methods=["PATCH"])
+@require_token
+def api_patch(name):
+    path = _api_entry_path(name)
+    title = ((request.get_json(silent=True) or {}).get("title") or "").strip()[:120]
+    if not title:
+        return _api_err(400, "validation", "title required")
+    with open(path[:-4] + ".title", "w", encoding="utf-8") as f:
+        f.write(title)
+    os.utime(path, None)   # LWW: renames bump the entry's mtime
+    log(g.api_user, title, "api-rename", name)
+    return jsonify({"name": name, "title": title})
+
+
+@app.route("/api/v1/library/<name>", methods=["DELETE"])
+@require_token
+def api_delete(name):
+    path = _api_entry_path(name)
+    with SHARE_LOCK:   # revoke any share links pointing at it
+        shares = _load_shares()
+        gone = [t for t, sh in shares.items()
+                if sh.get("owner") == g.api_user and sh.get("name") == name]
+        for t in gone:
+            shares.pop(t, None)
+        if gone:
+            _save_shares(shares)
+    for ext in ("", ".md", ".title", ".meta"):
+        try:
+            os.remove((path[:-4] + ext) if ext else path)
+        except OSError:
+            pass
+    log(g.api_user, name, "api-delete", f"shares-revoked={len(gone)}")
+    return "", 204
 
 
 def resume_jobs():
