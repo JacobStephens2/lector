@@ -3,21 +3,21 @@
 #   sudo cp deploy/lector.service /etc/systemd/system/lector.service
 #   sudo systemctl daemon-reload && sudo systemctl restart lector
 [Unit]
-Description=lector (markdown to speech) - stephens.page
+Description=lector (markdown to speech, sotto) - stephens.page
 After=network.target
 
 [Service]
 Type=simple
 User=lector
 Group=lector
-WorkingDirectory=/var/www/lector.stephens.page
+WorkingDirectory=/var/www/sotto.stephens.page
 EnvironmentFile=/etc/lector/lector.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 # Resume interrupted jobs on startup. Only the real service sets this, so a test
 # import of app.py never re-spawns workers.
 Environment=LECTOR_RESUME=1
-ExecStart=/var/www/lector.stephens.page/.venv/bin/waitress-serve --listen 127.0.0.1:3476 --threads 24 --channel-timeout 30 app:app
+ExecStart=/var/www/sotto.stephens.page/.venv/bin/waitress-serve --listen 127.0.0.1:3476 --threads 24 --channel-timeout 30 app:app
 Restart=on-failure
 RestartSec=5
 
@@ -26,7 +26,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/www/lector.stephens.page
+ReadWritePaths=/var/www/sotto.stephens.page
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true

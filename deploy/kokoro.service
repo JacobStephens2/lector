@@ -10,13 +10,13 @@ After=network.target
 Type=simple
 User=lector
 Group=lector
-WorkingDirectory=/var/www/lector.stephens.page/kokoro
+WorkingDirectory=/var/www/sotto.stephens.page/kokoro
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 # Bound the ONNX intra-op thread pool so it lines up with the CPU fence below.
 # Kokoro-82M runs ~1.4x realtime at 3-4 CPU threads on this box.
 Environment=OMP_NUM_THREADS=3
-ExecStart=/var/www/lector.stephens.page/kokoro/.venv/bin/waitress-serve --listen 127.0.0.1:3477 --threads 4 --channel-timeout 1800 server:app
+ExecStart=/var/www/sotto.stephens.page/kokoro/.venv/bin/waitress-serve --listen 127.0.0.1:3477 --threads 4 --channel-timeout 1800 server:app
 Restart=on-failure
 RestartSec=5
 
@@ -34,7 +34,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/www/lector.stephens.page/kokoro
+ReadWritePaths=/var/www/sotto.stephens.page/kokoro
 ProtectKernelTunables=true
 ProtectControlGroups=true
 

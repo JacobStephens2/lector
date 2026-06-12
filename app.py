@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""lector - paste a markdown document, get a narrated MP3.
+"""sotto - paste a markdown document, get a narrated MP3.
 
 Boundaries (see /about): the OpenAI key lives only in this process's environment
 (never the client, never the repo); accounts are password-gated with hashed
@@ -53,7 +53,7 @@ OPENAI_ALLOWED = {e.strip().lower() for e in _oa.split(",") if e.strip()} if _oa
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 TOKENS_PATH = os.path.join(STATE_DIR, "tokens.json")
 SHARES_PATH = os.path.join(STATE_DIR, "shares.json")
-BASE_URL = os.environ.get("LECTOR_BASE_URL", "https://lector.stephens.page")
+BASE_URL = os.environ.get("LECTOR_BASE_URL", "https://sotto.stephens.page")
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "resend")
@@ -491,7 +491,7 @@ def run_job(job_id, md, voice, title, owner, resume=False):
             saved = save_to_library(job, owner, job_id)   # durable target for the email link
             persist_job(job_id)
             link = f"{BASE_URL}/library#{saved}" if saved else f"{BASE_URL}/job/{job_id}"
-            send_email(owner, f'lector: "{title}" is ready',
+            send_email(owner, f'sotto: "{title}" is ready',
                        f"<p>Your narration <b>{_h(title)}</b> is ready "
                        f"({job['words']} words, narrated in {fmt_duration(job['secs'])}).</p>"
                        f'<p><a href="{link}">Listen in your Library</a>.</p>')
@@ -500,7 +500,7 @@ def run_job(job_id, md, voice, title, owner, resume=False):
         persist_job(job_id)
         log(owner, title, "error", str(e)[:200])
         if job.get("notify"):
-            send_email(owner, f'lector: "{title}" could not be completed',
+            send_email(owner, f'sotto: "{title}" could not be completed',
                        f"<p>Sorry - synthesizing <b>{_h(title)}</b> did not finish.</p>"
                        f'<p>You can <a href="{BASE_URL}/">try again</a>.</p>')
 
@@ -552,11 +552,11 @@ pre.src{white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,Me
 .shareurl{width:100%;box-sizing:border-box;font:12px ui-monospace,Menlo,monospace;padding:.4rem;margin:.3rem 0 0;color:#333;background:#f4f6f8}
 .linkbtn{background:none;color:#064b87;border:0;padding:0;margin:0;font:inherit;font-size:.92rem;font-weight:600;cursor:pointer;text-decoration:underline}
 </style></head><body>
-<nav>{% if user %}<a class=brand href="/">lector</a><a href="/library">library</a><span class=sp></span>
+<nav>{% if user %}<a class=brand href="/">sotto</a><a href="/library">library</a><span class=sp></span>
 <span class=who>{{user}}</span><a href="/account">account</a>{% if admin %}<a href="/admin">admin</a>{% endif %}<a href="/logout">log out</a>
-{% else %}<span class=brand>lector</span>{% endif %}</nav>
+{% else %}<span class=brand>sotto</span>{% endif %}</nav>
 {{body|safe}}
-<footer>lector reads documents aloud - it never emails, posts, or acts on your behalf; the only
+<footer>sotto reads documents aloud - it never emails, posts, or acts on your behalf; the only
 thing it makes public is a share link you create yourself, which you can revoke.
 {% if provider=='kokoro' %}By default, audio is synthesized on this server by Kokoro-82M
 (ONNX), an openly licensed model trained on documented public-domain and permissively licensed
@@ -568,7 +568,7 @@ by the vendor. The API key lives only in this server's environment.{% endif %}
 <script>function lskip(id,n){var a=document.getElementById(id);if(a){a.currentTime=Math.max(0,(a.currentTime||0)+n);}}</script>
 </body></html>"""
 
-HOME = """<h1><a href="/">lector</a></h1>
+HOME = """<h1><a href="/">sotto</a></h1>
 <p class=sub>Paste a markdown document. Get an MP3 you can listen to. &middot; <a href="/library">Library</a></p>
 <form method=post action="/convert" enctype=multipart/form-data>
 <input type=hidden name=_csrf value="{{csrf}}">
@@ -608,7 +608,7 @@ HOME = """<h1><a href="/">lector</a></h1>
 })();
 </script>"""
 
-JOB = """<h1><a href="/">lector</a></h1>
+JOB = """<h1><a href="/">sotto</a></h1>
 <p class=sub>{{job.title}}</p>
 {% if job.status in ['queued','running','done'] %}<details style="margin:0 0 .8rem"><summary class=muted style="cursor:pointer">Rename</summary>
 <form method=post action="/job/{{id}}/rename" style="margin-top:.4rem">
@@ -676,7 +676,7 @@ a.addEventListener('ended',function(){try{sessionStorage.removeItem(PK)}catch(e)
 <p><b>Error.</b> {{job.get('error','unknown')}}</p><p><a href="/">Try again</a></p>
 {% endif %}"""
 
-LIB = """<h1><a href="/">lector</a></h1>
+LIB = """<h1><a href="/">sotto</a></h1>
 <p class=sub>Library &middot; {{user}}'s saved narrations</p>
 {% if active %}
 <h2 style="font-size:1.05rem;margin:1.1rem 0 .3rem">In progress</h2>
@@ -723,7 +723,7 @@ function tick(){rows.forEach(function(row){var id=row.getAttribute('data-job');
 setTimeout(tick,5000);})();
 </script>"""
 
-ENTRY = """<h1><a href="/">lector</a></h1>
+ENTRY = """<h1><a href="/">sotto</a></h1>
 <p class=sub><a href="/library">Library</a> &middot; saved narration</p>
 <h2 style="font-size:1.25rem;margin:.2rem 0 .1rem">{{heading}}</h2>
 <p class=muted style="margin:.1rem 0 .6rem">{% if length %}{{length}} &middot; {% endif %}{{size}}{% if secs %} &middot; narrated in {{ fmt_duration(secs) }}{% endif %}{% if words %} &middot; {{words}} words{% endif %}</p>
@@ -750,7 +750,7 @@ ENTRY = """<h1><a href="/">lector</a></h1>
 <p style="margin-top:1.4rem"><a href="/library">Back to Library</a></p>"""
 
 SHARE_VIEW = """<h1>{{heading}}</h1>
-<p class=sub>Shared with you via lector &middot; narrated audio</p>
+<p class=sub>Shared with you via sotto &middot; narrated audio</p>
 <audio id=sh controls preload=metadata src="/share/{{token}}/audio"></audio>
 <div class=skiprow><button type=button onclick="lskip('sh',-15)">&laquo; 15s</button><button type=button onclick="lskip('sh',15)">15s &raquo;</button></div>
 <p><a href="/share/{{token}}/audio" download>Download audio</a>{% if has_text %} &middot; <a href="/share/{{token}}/text" download>Download text</a>{% endif %}</p>
@@ -758,7 +758,7 @@ SHARE_VIEW = """<h1>{{heading}}</h1>
 <pre class=src>{{text}}</pre></details>{% endif %}
 <p class=muted style="margin-top:1.4rem">Anyone with this link can listen. It was shared deliberately by its owner, who can revoke it.</p>"""
 
-LOGIN = """<h1>lector</h1><p class=sub>Reads your documents aloud. Please sign in.</p>
+LOGIN = """<h1>sotto</h1><p class=sub>Reads your documents aloud. Please sign in.</p>
 {% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
 <form method=post action="/login{{nextq}}">
 <input type=hidden name=_csrf value="{{csrf}}">
@@ -768,7 +768,7 @@ LOGIN = """<h1>lector</h1><p class=sub>Reads your documents aloud. Please sign i
 </form>
 <p class=muted><a href="/forgot">Forgot password?</a></p>"""
 
-ACCOUNT = """<h1><a href="/">lector</a></h1><p class=sub>Account &middot; {{user}}</p>
+ACCOUNT = """<h1><a href="/">sotto</a></h1><p class=sub>Account &middot; {{user}}</p>
 {% if msg %}<p style="color:#197">{{msg}}</p>{% endif %}{% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
 <form method=post action="/account">
 <input type=hidden name=_csrf value="{{csrf}}">
@@ -777,7 +777,7 @@ ACCOUNT = """<h1><a href="/">lector</a></h1><p class=sub>Account &middot; {{user
 <button type=submit>Change password</button>
 </form>"""
 
-ADMIN = """<h1><a href="/">lector</a></h1><p class=sub>Admin &middot; accounts</p>
+ADMIN = """<h1><a href="/">sotto</a></h1><p class=sub>Admin &middot; accounts</p>
 {% if msg %}<p style="color:#197">{{msg}}</p>{% endif %}{% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
 <table class=u><tr><th>Email</th><th>Role</th><th></th></tr>
 {% for u,info in users.items() %}<tr><td>{{u}}</td><td>{{'admin' if info.admin else 'user'}}</td>
@@ -792,7 +792,7 @@ ADMIN = """<h1><a href="/">lector</a></h1><p class=sub>Admin &middot; accounts</
 </form>"""
 
 
-FORGOT = """<h1>lector</h1><p class=sub>Reset your password</p>
+FORGOT = """<h1>sotto</h1><p class=sub>Reset your password</p>
 {% if sent %}<p>If an account exists for <b>{{email}}</b>, a password-reset link is on its way. Check your inbox.</p>
 <p class=muted><a href="/login">Back to sign in</a></p>
 {% else %}<form method=post action="/forgot"><input type=hidden name=_csrf value="{{csrf}}">
@@ -800,17 +800,17 @@ FORGOT = """<h1>lector</h1><p class=sub>Reset your password</p>
 <button type=submit>Send reset link</button></form>
 <p class=muted><a href="/login">Back to sign in</a></p>{% endif %}"""
 
-RESET = """<h1>lector</h1><p class=sub>{{ 'Set your password' if kind=='invite' else 'Choose a new password' }}</p>
+RESET = """<h1>sotto</h1><p class=sub>{{ 'Set your password' if kind=='invite' else 'Choose a new password' }}</p>
 {% if error %}<p style="color:#b00">{{error}}</p>{% endif %}
 <p class=muted>For <b>{{email}}</b>.</p>
 <form method=post><input type=hidden name=_csrf value="{{csrf}}">
 <label for=p>New password</label><input id=p name=new type=password autocomplete=new-password autofocus>
 <button type=submit>{{ 'Set password' if kind=='invite' else 'Reset password' }}</button></form>"""
 
-RESET_BAD = """<h1>lector</h1><p class=sub>Link expired</p>
+RESET_BAD = """<h1>sotto</h1><p class=sub>Link expired</p>
 <p>This link is invalid or has expired. <a href="/forgot">Request a new one</a>, or ask an administrator to re-send your invite.</p>"""
 
-RESET_DONE = """<h1>lector</h1><p class=sub>Password set</p><p>Your password is set. <a href="/login">Sign in</a>.</p>"""
+RESET_DONE = """<h1>sotto</h1><p class=sub>Password set</p><p>Your password is set. <a href="/login">Sign in</a>.</p>"""
 
 
 def render(body_tpl, title, **ctx):
@@ -862,7 +862,7 @@ def login():
     body = render_template_string(LOGIN, error=error, csrf=session.get("csrf"), nextq=nq)
     prov = default_backend_for(None)
     mdl = OPENAI_MODEL if prov == "openai" else KOKORO_MODEL_LABEL
-    return render_template_string(PAGE, title="lector - sign in", model=mdl, body=body,
+    return render_template_string(PAGE, title="sotto - sign in", model=mdl, body=body,
                                   provider=prov, may_openai=False, user=None, admin=False)
 
 
@@ -881,26 +881,26 @@ def forgot():
         sent = True
         if email in load_users():
             link = f"{BASE_URL}/reset/{new_token(email, 'reset', 3600)}"
-            send_email(email, "Reset your lector password",
-                       "<p>We received a request to reset your lector password.</p>"
+            send_email(email, "Reset your sotto password",
+                       "<p>We received a request to reset your sotto password.</p>"
                        f'<p><a href="{link}">Choose a new password</a>. This link expires in one hour.</p>'
                        "<p>If you did not request this, you can ignore this email.</p>")
         log(email or "-", "-", "reset-request", "")
-    return render(FORGOT, "lector - reset", sent=sent, email=email)
+    return render(FORGOT, "sotto - reset", sent=sent, email=email)
 
 
 @app.route("/reset/<token>", methods=["GET", "POST"])
 def reset(token):
     entry = peek_token(token)
     if not entry:
-        return render(RESET_BAD, "lector - link expired")
+        return render(RESET_BAD, "sotto - link expired")
     if request.method == "POST":
         entry = pop_token(token)
         if not entry:
-            return render(RESET_BAD, "lector - link expired")
+            return render(RESET_BAD, "sotto - link expired")
         new = request.form.get("new") or ""
         if len(new) < 8:
-            return render(RESET, "lector - set password", kind=entry["kind"],
+            return render(RESET, "sotto - set password", kind=entry["kind"],
                           email=entry["email"], error="Password must be at least 8 characters.")
         with USER_LOCK:
             users = load_users()
@@ -908,8 +908,8 @@ def reset(token):
                 users[entry["email"]]["pw"] = generate_password_hash(new)
                 save_users(users)
         log(entry["email"], "-", "password-set", entry["kind"])
-        return render(RESET_DONE, "lector - done")
-    return render(RESET, "lector - set password", kind=entry["kind"], email=entry["email"], error=None)
+        return render(RESET_DONE, "sotto - done")
+    return render(RESET, "sotto - set password", kind=entry["kind"], email=entry["email"], error=None)
 
 
 @app.route("/account", methods=["GET", "POST"])
@@ -929,14 +929,14 @@ def account():
                 save_users(users)
             log(current_user(), "-", "password-change", "")
             msg = "Password changed."
-    return render(ACCOUNT, "lector - account", msg=msg, error=error)
+    return render(ACCOUNT, "sotto - account", msg=msg, error=error)
 
 
 @app.route("/admin")
 def admin():
     if not is_admin():
         abort(403)
-    return render(ADMIN, "lector - admin", users=load_users(), msg=None, error=None)
+    return render(ADMIN, "sotto - admin", users=load_users(), msg=None, error=None)
 
 
 @app.route("/admin/add", methods=["POST"])
@@ -958,14 +958,14 @@ def admin_add():
             save_users(users)
         user_lib(u)
         link = f"{BASE_URL}/reset/{new_token(u, 'invite', 7 * 24 * 3600)}"
-        ok = send_email(u, "You've been invited to lector",
-                        "<p>An administrator created a lector account for you.</p>"
+        ok = send_email(u, "You've been invited to sotto",
+                        "<p>An administrator created a sotto account for you.</p>"
                         f'<p><a href="{link}">Set your password</a>, then sign in at {BASE_URL}. '
                         "This link expires in seven days.</p>")
         log(current_user(), u, "account-create", "admin" if request.form.get("admin") else "user")
         msg = (f"Created {u}. Invite emailed." if ok
                else f"Created {u}, but the email failed - send them this link: {link}")
-    return render(ADMIN, "lector - admin", users=load_users(), msg=msg, error=error)
+    return render(ADMIN, "sotto - admin", users=load_users(), msg=msg, error=error)
 
 
 @app.route("/admin/delete", methods=["POST"])
@@ -983,7 +983,7 @@ def admin_delete():
             save_users(users)
         log(current_user(), u, "account-delete", "")
         msg = f"Deleted account '{u}'. Their saved files remain on disk."
-    return render(ADMIN, "lector - admin", users=load_users(), msg=msg, error=error)
+    return render(ADMIN, "sotto - admin", users=load_users(), msg=msg, error=error)
 
 
 # --------------------------------------------------------------------- conversion
@@ -1022,7 +1022,7 @@ def calibrated_rates(user):
 def home():
     u = current_user()
     kr, orr = calibrated_rates(u)
-    return render(HOME, "lector", groups=voice_groups_for(u), default=preferred_voice(u),
+    return render(HOME, "sotto", groups=voice_groups_for(u), default=preferred_voice(u),
                   openai_voices=OPENAI_VOICES if may_use_openai(u) else [],
                   kokoro_rate=kr, openai_rate=orr)
 
@@ -1074,11 +1074,11 @@ def owned_job(job_id):
 def job_page(job_id):
     job = owned_job(job_id)
     pct = int(100 * job.get("done", 0) / (job.get("total") or 1)) if job["status"] == "running" else (100 if job["status"] == "done" else 0)
-    slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "lector"
+    slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "sotto"
     elapsed = fmt_duration(time.time() - job["created"]) if job.get("created") else None
     # A running job updates via JS polling (see JOB template) rather than a full
     # page refresh, so previewing the partial audio is not interrupted.
-    return render(JOB, "lector - " + job["title"][:40], job=job, id=job_id, pct=pct, slug=slug,
+    return render(JOB, "sotto - " + job["title"][:40], job=job, id=job_id, pct=pct, slug=slug,
                   elapsed=elapsed)
 
 
@@ -1089,7 +1089,7 @@ def job_audio(job_id):
     # Serve the partial while running (preview) as well as the finished file.
     if job.get("status") not in ("running", "done") or not os.path.isfile(path):
         abort(404)
-    slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "lector"
+    slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "sotto"
     return send_file(path, mimetype="audio/mpeg", download_name=slug + ".mp3",
                      conditional=not app.config["USE_X_SENDFILE"])
 
@@ -1196,7 +1196,7 @@ def library():
                            "pct": int(100 * done / total) if total else 0,
                            "created": j.get("created", 0)})
     active.sort(key=lambda a: a["created"], reverse=True)
-    return render(LIB, "lector - library", items=items, active=active)
+    return render(LIB, "sotto - library", items=items, active=active)
 
 
 @app.route("/library/<name>")
@@ -1256,7 +1256,7 @@ def library_entry(name):
             text = None
     sh = _user_shares(current_user()).get(name)
     title = lib_title(lib, name)
-    return render(ENTRY, "lector - " + title[:40], name=name, heading=title,
+    return render(ENTRY, "sotto - " + title[:40], name=name, heading=title,
                   size=f"{os.path.getsize(path) / 1048576:.1f} MB",
                   length=fmt_duration(dur) if dur else None,
                   secs=meta.get("secs"), words=meta.get("words"),
@@ -1334,7 +1334,7 @@ def share(token):
                 text = open(tp, encoding="utf-8", errors="replace").read()
             except Exception:
                 text = None
-    return render(SHARE_VIEW, "lector - " + title[:40], token=token, heading=title,
+    return render(SHARE_VIEW, "sotto - " + title[:40], token=token, heading=title,
                   text=text, has_text=text is not None)
 
 
@@ -1371,7 +1371,7 @@ def sample(voice):
 
 @app.route("/about")
 def about():
-    return render(ABOUT, "lector - about")
+    return render(ABOUT, "sotto - about")
 
 
 @app.route("/favicon.svg")
@@ -1386,9 +1386,9 @@ def healthz():
     return "ok\n", 200
 
 
-ABOUT = """<h1><a href="/">lector</a></h1>
+ABOUT = """<h1><a href="/">sotto</a></h1>
 <p class=sub>How it works, and the boundaries it keeps</p>
-<p>lector turns a markdown document into a narrated MP3. It cleans the markup first
+<p>sotto turns a markdown document into a narrated MP3. It cleans the markup first
 (links and raw URLs dropped, <code>&sect;102</code> read as "section 102", tables flattened
 into sentences), splits the text into chunks, sends each to {% if provider=='kokoro' %}a
 text-to-speech model running on this server{% else %}OpenAI's text-to-speech API{% endif %},
@@ -1403,24 +1403,24 @@ salted hashes, and sessions are signed, HTTPS-only cookies.</li>
 on this server, so no credential and no audio ever leave it.</li>
 <li><b>Bounded scope.</b> The only outbound call is to a text-to-speech model running on this
 same machine; input is size-capped; there is no shell and no arbitrary network access.</li>
-<li><b>Not delegated.</b> lector produces audio and stops. It never acts on its own - it does
+<li><b>Not delegated.</b> sotto produces audio and stops. It never acts on its own - it does
 not email, post, or publish anything unless you deliberately create a share link, which you
 control and can revoke at any time.</li>
 <li><b>Traceability.</b> Every job and account action writes one audit line.</li>
 <li><b>Provenance honesty.</b> The voice is synthetic, produced by Kokoro-82M - an openly
 licensed (Apache-2.0) model trained on documented public-domain and permissively licensed audio.
-lector can name what reads to you rather than passing the audio off as neutral.</li>
+sotto can name what reads to you rather than passing the audio off as neutral.</li>
 {% else %}
 <li><b>Secret isolation.</b> The OpenAI key lives only in this server process's
 environment - never in a page, never in the source repository, never sent to your browser.</li>
 <li><b>Bounded scope.</b> The only outbound call is to the text-to-speech API; input is
 size-capped; there is no shell and no arbitrary network access.</li>
-<li><b>Not delegated.</b> lector produces audio and stops. It never acts on its own - it does
+<li><b>Not delegated.</b> sotto produces audio and stops. It never acts on its own - it does
 not email, post, or publish anything unless you deliberately create a share link, which you
 control and can revoke at any time.</li>
 <li><b>Traceability.</b> Every job and account action writes one audit line.</li>
 <li><b>Provenance honesty.</b> The voice is synthetic and the model vendor does not disclose
-its training data or the labor behind it; lector says so rather than passing the audio off as neutral.</li>
+its training data or the labor behind it; sotto says so rather than passing the audio off as neutral.</li>
 {% endif %}
 </ul>
 <p><a href="/">Back</a></p>"""

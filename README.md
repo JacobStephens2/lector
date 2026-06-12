@@ -1,7 +1,7 @@
-# lector
+# sotto
 
 Paste a markdown document, get a narrated MP3. Self-hosted at
-`lector.stephens.page` behind a password.
+`sotto.stephens.page` behind a password.
 
 It exists because long strategic documents (plans, ADRs, specs) are easier to
 absorb on a walk than at a desk. It also serves as a small, honest example of
@@ -46,11 +46,11 @@ should be, so the same checklist is visible in something small:
   browser. With the Kokoro backend there is no third-party key at all.
 - **Bounded scope** - the only outbound call is to the TTS API; input is size-
   capped; there is no shell and no arbitrary network access.
-- **Not delegated** - lector produces audio and stops. It never acts on its own: it
+- **Not delegated** - sotto produces audio and stops. It never acts on its own: it
   does not email, post, or publish anything unless you deliberately create a share
   link, which you control and can revoke.
 - **Traceability** - every job appends one audit line (time, user, title, outcome)
-  to `lector.log`.
+  to `sotto.log`.
 - **Provenance honesty** - the `/about` page states that the voice is synthetic
   and that the model vendor does not disclose training data or upstream labor,
   rather than presenting the audio as neutral.
@@ -65,7 +65,7 @@ echo 'LECTOR_OPENAI_ALLOWED=you@example.com' | sudo tee -a /etc/lector/lector.en
 .venv/bin/waitress-serve --listen 127.0.0.1:3476 app:app
 ```
 
-Apache terminates TLS and reverse-proxies `lector.stephens.page` to
+Apache terminates TLS and reverse-proxies `sotto.stephens.page` to
 `127.0.0.1:3476`; authentication is the app's own session login, not anything at
 the proxy. systemd (`lector.service`) keeps it running.
 
