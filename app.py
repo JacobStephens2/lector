@@ -489,7 +489,7 @@ def run_job(job_id, md, voice, title, owner, resume=False):
             link = f"{BASE_URL}/library#{saved}" if saved else f"{BASE_URL}/job/{job_id}"
             send_email(owner, f'lector: "{title}" is ready',
                        f"<p>Your narration <b>{_h(title)}</b> is ready "
-                       f"({job['words']} words, synthesized in {fmt_duration(job['secs'])}).</p>"
+                       f"({job['words']} words, narrated in {fmt_duration(job['secs'])}).</p>"
                        f'<p><a href="{link}">Listen in your Library</a>.</p>')
     except Exception as e:
         job.update(status="error", error=str(e))
@@ -594,43 +594,58 @@ JOB = """<h1><a href="/">lector</a></h1>
 <button class=linkbtn type=submit style="margin-left:.5rem">Save name</button>
 </form></details>{% endif %}
 {% if job.status in ['queued','running'] %}
-<p><b>Synthesizing...</b> <span id=prog>{{job.get('done',0)}} / {{job.get('total','?')}}</span> chunks
-{% if job.get('words') %}({{job.words}} words){% endif %}</p>
+<p><b>Narrating...</b> <span id=prog>{{job.get('done',0)}} / {{job.get('total','?')}}</span> chunks
+{% if job.get('words') %}({{job.words}} words){% endif %}{% if elapsed %} <span class=muted>&middot; <span id=el>{{elapsed}}</span> so far</span>{% endif %}</p>
 <div class=bar><i id=bar style="width:{{pct}}%"></i></div>
 <p class=muted>This runs on the server. {% if job.get('notify') %}You can close this page - we'll email {{user}} a link when it's ready.{% else %}It keeps running if you close this page; reopen this URL to check on it.{% endif %}</p>
 <div id=preview style="display:{% if job.get('done',0) %}block{% else %}none{% endif %};margin-top:1.1rem">
-<p class=muted style="margin:0 0 .2rem"><span id=pvmsg>Loading a preview of the audio synthesized so far...</span></p>
+<p class=muted style="margin:0 0 .2rem"><span id=pvmsg>Loading a preview of the oration so far...</span></p>
 <audio id=pv controls preload=none></audio>
 <div class=skiprow><button type=button onclick="loadpv()">Load latest</button><button type=button onclick="lskip('pv',-15)">&laquo; 15s</button><button type=button onclick="lskip('pv',15)">15s &raquo;</button></div>
 </div>
 {% if job.get('cancel') %}<p class=muted>Stopping after the current chunk...</p>
-{% else %}<form method=post action="/job/{{id}}/stop"><input type=hidden name=_csrf value="{{csrf}}"><button class=linkbtn type=submit>Stop synthesis</button></form>{% endif %}
+{% else %}<form method=post action="/job/{{id}}/stop"><input type=hidden name=_csrf value="{{csrf}}"><button class=linkbtn type=submit>Stop narrating</button></form>{% endif %}
 <script>
-var JID="{{id}}";
+var JID="{{id}}",PK="lpos-"+JID;
 function pvmsg(t){var m=document.getElementById('pvmsg');if(m)m.textContent=t;}
+function spos(a){try{sessionStorage.setItem(PK,JSON.stringify({t:a.currentTime||0,p:!a.paused}))}catch(e){}}
+function gpos(){try{return JSON.parse(sessionStorage.getItem(PK))}catch(e){return null}}
 function loadpv(){var a=document.getElementById('pv');var t=a.currentTime||0;
- pvmsg("Loading a preview of the audio synthesized so far...");
+ if(!t){var s=gpos();if(s)t=s.t||0;}   // restore position across a page refresh
+ pvmsg("Loading a preview of the oration so far...");
  a.src="/job/"+JID+"/audio?n="+Date.now();a.load();
- a.addEventListener('loadedmetadata',function h(){try{a.currentTime=t;}catch(e){}pvmsg("Preview of the audio synthesized so far:");a.removeEventListener('loadedmetadata',h);});
+ a.addEventListener('loadedmetadata',function h(){try{a.currentTime=t;}catch(e){}pvmsg("Preview of the oration so far:");a.removeEventListener('loadedmetadata',h);});
  a.addEventListener('error',function h(){pvmsg("Preview will be ready shortly...");a.removeEventListener('error',h);});}
-(function(){var pv=document.getElementById('preview');var primed=false;
-if(pv&&pv.style.display!=="none"){primed=true;loadpv();}   // a preview already exists at load -> show it now
+(function(){var pv=document.getElementById('preview');var a=document.getElementById('pv');var primed=false;
+['timeupdate','pause','play'].forEach(function(ev){a.addEventListener(ev,function(){spos(a);});});
+var s=gpos();
+if(pv&&pv.style.display!=="none"){primed=true;loadpv();
+ if(s&&s.p){a.addEventListener('loadedmetadata',function h(){a.play().catch(function(){});a.removeEventListener('loadedmetadata',h);});}}
 function poll(){fetch("/job/"+JID+"/status",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
- if(d.status!=="running"&&d.status!=="queued"){location.reload();return;}
+ if(d.status!=="running"&&d.status!=="queued"){spos(a);location.reload();return;}
  document.getElementById('prog').textContent=d.done+" / "+(d.total||"?");
  document.getElementById('bar').style.width=d.pct+"%";
+ if(d.elapsed){var e=document.getElementById('el');if(e)e.textContent=d.elapsed;}
  if(d.done>0){pv.style.display="block";if(!primed){primed=true;loadpv();}}
  setTimeout(poll,4000);
 }).catch(function(){setTimeout(poll,6000);});}
 setTimeout(poll,4000);})();
 </script>
 {% elif job.status=='stopped' %}
-<p><b>Stopped.</b> You stopped this synthesis{% if job.get('total') %} after {{job.get('done',0)}} of {{job.total}} chunks{% endif %}.</p>
+<p><b>Stopped.</b> You stopped this narration{% if job.get('total') %} after {{job.get('done',0)}} of {{job.total}} chunks{% endif %}.</p>
 <p><a href="/">Convert another</a></p>
 {% elif job.status=='done' %}
-<p><b>Ready.</b> {{job.words}} words, {{job.total}} chunks, synthesized in {{ fmt_duration(job.secs) }}.</p>
+<p><b>Ready.</b> {{job.words}} words, {{job.total}} chunks, narrated in {{ fmt_duration(job.secs) }}.</p>
 <audio id=pj controls preload=metadata src="/job/{{id}}/audio"></audio>
 <div class=skiprow><button type=button onclick="lskip('pj',-15)">&laquo; 15s</button><button type=button onclick="lskip('pj',15)">15s &raquo;</button></div>
+<script>
+(function(){var a=document.getElementById('pj'),PK="lpos-{{id}}",s=null;
+try{s=JSON.parse(sessionStorage.getItem(PK))}catch(e){}
+if(s&&s.t){a.addEventListener('loadedmetadata',function h(){try{a.currentTime=s.t}catch(e){}if(s.p)a.play().catch(function(){});a.removeEventListener('loadedmetadata',h);});}
+['timeupdate','pause','play'].forEach(function(ev){a.addEventListener(ev,function(){try{sessionStorage.setItem(PK,JSON.stringify({t:a.currentTime||0,p:!a.paused}))}catch(e){}});});
+a.addEventListener('ended',function(){try{sessionStorage.removeItem(PK)}catch(e){}});
+})();
+</script>
 <p><a href="/job/{{id}}/audio" download="{{slug}}.mp3">Download MP3</a> &middot; <a href="/">Convert another</a></p>
 {% if job.get('saved') %}<p class=muted>Saved to <a href="/library#{{job.saved}}">Library</a> as {{job.saved}}.</p>
 {% else %}<form method=post action="/job/{{id}}/save"><input type=hidden name=_csrf value="{{csrf}}"><button type=submit>Save to Library</button></form>{% endif %}
@@ -688,7 +703,7 @@ setTimeout(tick,5000);})();
 ENTRY = """<h1><a href="/">lector</a></h1>
 <p class=sub><a href="/library">Library</a> &middot; saved narration</p>
 <h2 style="font-size:1.25rem;margin:.2rem 0 .1rem">{{heading}}</h2>
-<p class=muted style="margin:.1rem 0 .6rem">{% if length %}{{length}} &middot; {% endif %}{{size}}{% if secs %} &middot; synthesized in {{ fmt_duration(secs) }}{% endif %}{% if words %} &middot; {{words}} words{% endif %}</p>
+<p class=muted style="margin:.1rem 0 .6rem">{% if length %}{{length}} &middot; {% endif %}{{size}}{% if secs %} &middot; narrated in {{ fmt_duration(secs) }}{% endif %}{% if words %} &middot; {{words}} words{% endif %}</p>
 <audio id=de controls preload=metadata src="/library/{{name}}"></audio>
 <div class=skiprow><button type=button onclick="lskip('de',-15)">&laquo; 15s</button><button type=button onclick="lskip('de',15)">15s &raquo;</button></div>
 <p><a href="/library/{{name}}" download>Download audio</a>{% if text is not none %} &middot; <a href="/library/{{text_name}}" download>Download text</a>{% endif %}</p>
@@ -1003,9 +1018,11 @@ def job_page(job_id):
     job = owned_job(job_id)
     pct = int(100 * job.get("done", 0) / (job.get("total") or 1)) if job["status"] == "running" else (100 if job["status"] == "done" else 0)
     slug = re.sub(r"[^a-z0-9]+", "-", job["title"].lower()).strip("-")[:60] or "lector"
+    elapsed = fmt_duration(time.time() - job["created"]) if job.get("created") else None
     # A running job updates via JS polling (see JOB template) rather than a full
     # page refresh, so previewing the partial audio is not interrupted.
-    return render(JOB, "lector - " + job["title"][:40], job=job, id=job_id, pct=pct, slug=slug)
+    return render(JOB, "lector - " + job["title"][:40], job=job, id=job_id, pct=pct, slug=slug,
+                  elapsed=elapsed)
 
 
 @app.route("/job/<job_id>/audio")
@@ -1026,8 +1043,9 @@ def job_status(job_id):
     total = job.get("total") or 0
     done = job.get("done", 0)
     pct = int(100 * done / total) if total else (100 if job.get("status") == "done" else 0)
+    elapsed = fmt_duration(time.time() - job["created"]) if job.get("created") else None
     return {"status": job.get("status"), "done": done, "total": job.get("total"),
-            "words": job.get("words"), "pct": pct}
+            "words": job.get("words"), "pct": pct, "elapsed": elapsed}
 
 
 @app.route("/job/<job_id>/save", methods=["POST"])
