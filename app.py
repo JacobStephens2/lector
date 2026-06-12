@@ -26,6 +26,10 @@ for d in (JOBS_DIR, LIBRARY_DIR, STATE_DIR):
 
 CHUNK_LIMIT = 3600          # OpenAI input ceiling per request
 KOKORO_CHUNK_LIMIT = 1000   # smaller for the local model: bounds per-request memory and latency
+# Rough seconds-per-word for the on-form time estimate (calibrated from real runs:
+# Kokoro ~0.26 s/word on this box, OpenAI ~0.06 s/word). Used by JS only.
+KOKORO_SECS_PER_WORD = 0.26
+OPENAI_SECS_PER_WORD = 0.06
 MAX_INPUT = 400 * 1024
 INSTRUCTIONS = ("Read as a calm, measured, articulate audiobook narrator. "
                 "Natural pacing, clear diction, a short pause at each section heading.")
@@ -572,6 +576,7 @@ HOME = """<h1><a href="/">lector</a></h1>
 <input id=title name=title type=text maxlength=120 placeholder="Name this oration; defaults to the document's heading" style="width:100%;box-sizing:border-box">
 <label for=md>Markdown</label>
 <textarea id=md name=md placeholder="# Paste markdown here, or choose a .md file below"></textarea>
+<p id=eta class=muted style="margin:.4rem 0 0;min-height:1.2em"></p>
 <div class=row>
 <div><label for=file>...or upload a file</label><input id=file type=file name=file accept=".md,.markdown,.txt"></div>
 <div><label for=voice>Voice</label><select id=voice name=voice>{% for label, vs in groups %}<optgroup label="{{label}}">{% for v in vs %}<option{% if v==default %} selected{% endif %}>{{v}}</option>{% endfor %}</optgroup>{% endfor %}</select></div>
@@ -583,7 +588,25 @@ HOME = """<h1><a href="/">lector</a></h1>
 <label style="font-weight:400;display:flex;align-items:center;gap:.5rem;margin-top:1.1rem"><input type=checkbox name=notify value=1 checked style="width:auto;margin:0"> Email me a link when it's ready (it runs on the server, so you can close this page)</label>
 <button type=submit>Convert to audio</button>
 </form>
-<p class=muted style=margin-top:1.4rem>Citations like <code>&sect;102</code> are read as "section 102"; tables are read as plain sentences; links and raw URLs are dropped.</p>"""
+<p class=muted style=margin-top:1.4rem>Citations like <code>&sect;102</code> are read as "section 102"; tables are read as plain sentences; links and raw URLs are dropped.</p>
+<script>
+(function(){
+ var md=document.getElementById('md'),file=document.getElementById('file'),voice=document.getElementById('voice'),eta=document.getElementById('eta');
+ var OAV={{ openai_voices|tojson }},RK={{kokoro_rate}},RO={{openai_rate}},fileWords=null;
+ function fmt(s){s=Math.round(s);if(s<90)return s+' sec';var m=Math.round(s/60);if(m<60)return m+' min';var h=Math.floor(m/60);return h+' h '+(m%60)+' min';}
+ function words(t){t=(t||'').trim();return t?t.split(/\\s+/).length:0;}
+ function rate(){return OAV.indexOf(voice.value)>=0?RO:RK;}
+ function show(){var w=fileWords!=null?fileWords:words(md.value);
+  if(!w){eta.textContent='';return;}
+  eta.textContent='Estimated narration time: about '+fmt(w*rate())+' · '+w.toLocaleString()+' words.';}
+ md.addEventListener('input',function(){fileWords=null;show();});
+ voice.addEventListener('change',show);
+ file.addEventListener('change',function(){var f=file.files&&file.files[0];
+  if(!f){fileWords=null;show();return;}
+  var r=new FileReader();r.onload=function(){fileWords=words(r.result);show();};r.readAsText(f);});
+ show();
+})();
+</script>"""
 
 JOB = """<h1><a href="/">lector</a></h1>
 <p class=sub>{{job.title}}</p>
@@ -967,7 +990,9 @@ def admin_delete():
 @app.route("/")
 def home():
     u = current_user()
-    return render(HOME, "lector", groups=voice_groups_for(u), default=preferred_voice(u))
+    return render(HOME, "lector", groups=voice_groups_for(u), default=preferred_voice(u),
+                  openai_voices=OPENAI_VOICES if may_use_openai(u) else [],
+                  kokoro_rate=KOKORO_SECS_PER_WORD, openai_rate=OPENAI_SECS_PER_WORD)
 
 
 @app.route("/convert", methods=["POST"])
