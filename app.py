@@ -987,12 +987,44 @@ def admin_delete():
 
 
 # --------------------------------------------------------------------- conversion
+def calibrated_rates(user):
+    """Seconds-per-word per backend, learned from this user's saved .meta history,
+    falling back to the defaults. Uses the MEDIAN per-job rate so a resumed job
+    (whose recorded time undercounts true wall-clock) doesn't skew the estimate."""
+    samples = {"kokoro": [], "openai": []}
+    try:
+        names = os.listdir(user_lib(user))
+    except OSError:
+        names = []
+    for n in names:
+        if not n.endswith(".meta"):
+            continue
+        try:
+            m = json.load(open(os.path.join(user_lib(user), n)))
+        except Exception:
+            continue
+        secs, words = m.get("secs"), m.get("words")
+        if secs and words and words >= 50:   # skip tiny/empty runs
+            samples[backend_of_voice(m.get("voice") or "")].append(secs / words)
+
+    def med(xs, default):
+        if not xs:
+            return default
+        xs = sorted(xs)
+        mid = len(xs) // 2
+        return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+    return (round(med(samples["kokoro"], KOKORO_SECS_PER_WORD), 4),
+            round(med(samples["openai"], OPENAI_SECS_PER_WORD), 4))
+
+
 @app.route("/")
 def home():
     u = current_user()
+    kr, orr = calibrated_rates(u)
     return render(HOME, "lector", groups=voice_groups_for(u), default=preferred_voice(u),
                   openai_voices=OPENAI_VOICES if may_use_openai(u) else [],
-                  kokoro_rate=KOKORO_SECS_PER_WORD, openai_rate=OPENAI_SECS_PER_WORD)
+                  kokoro_rate=kr, openai_rate=orr)
 
 
 @app.route("/convert", methods=["POST"])
